@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Order Fulfilment</title>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="theme.css">
+</head>
+<body>
+
+<div id="loginView" class="login" hidden>
+  <h1>Order Fulfilment</h1>
+  <p class="muted">Sign in with your work email.</p>
+  <form id="loginForm" style="display:flex;flex-direction:column;gap:12px">
+    <label>Email<input class="input" id="loginEmail" type="email" autocomplete="username" required></label>
+    <label>Password<input class="input" id="loginPass" type="password" autocomplete="current-password" required></label>
+    <button class="btn gold" type="submit">Sign in</button>
+  </form>
+  <div id="loginMsg" class="banner err" hidden></div>
+</div>
+
+<div id="appView" hidden>
+  <header class="top">
+    <div class="brand">Order Fulfilment</div>
+    <nav class="tabs" role="tablist" id="tabs"></nav>
+    <div class="who"><span id="whoEmail"></span><span class="role" id="whoRole"></span><button class="btn sm ghost" id="signOut">Sign out</button></div>
+  </header>
+  <main id="main"></main>
+</div>
+
+<div id="modalRoot"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js"></script>
+<script>
+const supa = window.supabase.createClient(CONFIG.SB_URL, CONFIG.SB_KEY);
+
+// ---------- state ----------
+const S = {
+  role: null, email: '', userId: null,
+  view: 'board', query: '', boardFilter: 'open', lookupOpenOnly: false,
+  locations: [], locByName: {}, orders: {}, lines: [], attempts: [], events: [], stock: {}, adjustments: [],
+  loadedAt: null, syncMsg: null,
+};
+const isAdmin = () => S.role === 'admin';
+const PROV_NEAR = {
+  WC:['WC','EC','NC','FS','NW','GP','NL','MP','LP'], EC:['EC','WC','NL','FS','NC','GP','NW','MP','LP'],
+  NC:['NC','FS','WC','NW','EC','GP','NL','MP','LP'], FS:['FS','NC','NW','GP','NL','EC','WC','MP','LP'],
+  NW:['NW','GP','FS','NC','LP','MP','NL','EC','WC'], GP:['GP','NW','MP','FS','LP','NL','NC','EC','WC'],
+  NL:['NL','MP','FS','GP','EC','NW','LP','NC','WC'], MP:['MP','GP','LP','NL','NW','FS','NC','EC','WC'],
+  LP:['LP','GP','MP','NW','NL','FS','NC','EC','WC'],
+};
+const STATUS_LABEL = { wait:'Waiting', ok:'Has stock', bad:'No stock', hold:'On hold', sent:'Collected', released:'Released' };
+
+// ---------- helpers ----------
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  if (attrs) for (const [k, v] of Object.entries(attrs)) {
+    if (v == null || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (k === 'text') e.textContent = v;
+    else e.setAttribute(k, v === true ? '' : v);
+  }
+  for (const k of kids.flat()) if (k != null && k !== false) e.append(k.nodeType ? k : document.createTextNode(String(k)));
+  return e;
+}
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function when(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-ZA', { day:'numeric', month:'short' }) + ' ' + d.toLocaleTimeString('en-ZA', { hour:'2-digit', minute:'2-digit' });
+}
+function toast(msg) {
+  const t = h('div', { class:'toast', role:'status' }, msg);
+  document.body.append(t);
+  setTimeout(() => t.remove(), 2600);
+}
+const short = name => (S.locByName[name]?.short_name) || String(name || '').replace(/^FOM\s+/, '');
+const normOrder = s => { const t = String(s || '').trim().toUpperCase().replace(/\s+/g, '').replace(/^#/, ''); return t ? (t.startsWith('FOM') ? t : 'FOM' + t) : ''; };
+const avail = (sku, loc) => S.stock[sku]?.[loc] ?? 0;
+const hqLoc = () => S.locations.find(l => l.is_hq)?.name || 'FOM Online';
+
+// ---------- derived line status ----------
+function attemptsFor(line) { return S.attempts.filter(a => a.line_id === line.id).sort((a, b) => b.created_at.localeCompare(a.created_at)); }
+function stageOf(line) {
+  const att = attemptsFor(line)[0] || null;
+  if (line.state === 'refund') return { key:'refund', label:'Refund', att };
+  if (line.state === 'cancelled') return { key:'cancelled', label:'Cancelled', att };
+  if (line.state === 'hq_found') return { key:'hq', label:'Found at HQ', att };
+  if (line.hq_check === 'pending' && !att) return { key:'hq_check', label:'Warehouse rechecking', att };
+  if (!att) return { key:'new', label:'Needs a store', att };
+  if (att.status === 'bad') return { key:'bad', label:'No stock – find another store', att };
+  if (att.status === 'wait') return { key:'wait', label: att.stock_mail_at ? 'Waiting for store' : 'Stock check to send', att };
+  if (att.status === 'ok') return { key:'ok', label: att.collect_mail_at ? 'Awaiting Aramex' : 'Store has it – book collection', att };
+  if (att.status === 'hold') return { key:'hold', label:'On hold', att };
+  return { key:'sent', label:'Collected', att };
+}
+function sayFor(line, st) {
+  const s = st.att ? short(st.att.location_name) : '';
+  switch (st.key) {
+    case 'refund': return 'No store can supply this item. It will be refunded.';
+    case 'cancelled': return 'Item cancelled.';
+    case 'hq': return 'The warehouse found it. It ships from HQ.';
+    case 'hq_check': return `The warehouse system shows ${avail(line.sku, hqLoc())} at HQ. The warehouse is checking again.`;
+    case 'new': return 'Being sourced. A store has not been asked yet.';
+    case 'bad': return `${s} doesn't have it. We're asking another store.`;
+    case 'wait': return st.att.stock_mail_at ? `Stock check sent to ${s}. Waiting for the store to reply.` : `${s} will be asked to check stock.`;
+    case 'ok': return st.att.collect_mail_at ? `${s} has it set aside. Aramex collection has been requested.` : `${s} has it set aside. Collection still to be booked.`;
+    case 'hold': return `On hold at ${s}. Waiting on a decision from the DC.`;
+    default: return `Collected by Aramex from ${s}.`;
+  }
+}
+const isOpenStage = k => !['sent','hq','refund','cancelled'].includes(k);
+
+// ---------- store suggestion ----------
+function suggestStores(line, limit = 4) {
+  const order = S.orders[line.order_name] || {};
+  const tried = new Set(attemptsFor(line).map(a => a.location_name));
+  const near = PROV_NEAR[order.province_code] || PROV_NEAR.WC;
+  const city = String(order.city || '').toLowerCase().trim();
+  // Other open items on the same order still needing a store: prefer a store that can do them all
+  const siblings = S.lines.filter(l => l.order_name === line.order_name && l.id !== line.id && ['new','bad'].includes(stageOf(l).key));
+  const cands = S.locations.filter(l => l.sourceable && !l.is_hq && !tried.has(l.name) && avail(line.sku, l.name) >= line.qty);
+  return cands.map(l => {
+    let score = near.indexOf(l.province_code); if (score < 0) score = 9;
+    if (city && l.city && l.city.toLowerCase() === city) score -= 0.5;
+    const covers = siblings.filter(s => avail(s.sku, l.name) >= s.qty).length;
+    score -= covers * 0.3;
+    return { loc: l, score, qty: avail(line.sku, l.name), covers };
+  }).sort((a, b) => a.score - b.score || b.qty - a.qty).slice(0, limit);
+}
+
+// ---------- data ----------
+async function loadAll() {
+  const since = new Date(Date.now() - CONFIG.LOOKBACK_DAYS * 864e5).toISOString();
+  const [loc, lines, adj, sync, flags, scan] = await Promise.all([
+    supa.from('ful_locations').select('*').order('sort').order('name'),
+    supa.from('ful_lines').select('*').gte('added_at', since).order('added_at', { ascending:false }).limit(2000),
+    supa.from('ful_hq_adjustments').select('*').order('reported_at', { ascending:false }).limit(500),
+    supa.from('ful_sync_log').select('*').order('at', { ascending:false }).limit(1),
+    supa.from('ful_mail_log').select('*').eq('outcome', 'flagged').is('reviewed_at', null).order('received_at', { ascending:false }).limit(50),
+    supa.from('ful_mail_log').select('scanned_at').order('scanned_at', { ascending:false }).limit(1),
+  ]);
+  for (const r of [loc, lines, adj, sync, flags, scan]) if (r.error) throw r.error;
+  S.lastSync = sync.data[0] || null;
+  S.mailFlags = flags.data;
+  S.lastScan = scan.data[0]?.scanned_at || null;
+  S.locations = loc.data; S.locByName = Object.fromEntries(loc.data.map(l => [l.name, l]));
+  S.lines = lines.data; S.adjustments = adj.data;
+  const ids = S.lines.map(l => l.id);
+  const orderNames = [...new Set(S.lines.map(l => l.order_name))];
+  const skus = [...new Set(S.lines.map(l => l.sku))];
+  const chunks = (a, n) => Array.from({ length: Math.ceil(a.length / n) }, (_, i) => a.slice(i * n, i * n + n));
+  const att = [], ord = [], st = [], ev = [];
+  for (const c of chunks(ids, 200)) {
+    const [a, e] = await Promise.all([
+      supa.from('ful_attempts').select('*').in('line_id', c),
+      supa.from('ful_events').select('*').in('line_id', c).order('at'),
+    ]);
+    if (a.error) throw a.error; if (e.error) throw e.error;
+    att.push(...a.data); ev.push(...e.data);
+  }
+  for (const c of chunks(orderNames, 200)) { const r = await supa.from('ful_orders').select('*').in('order_name', c); if (r.error) throw r.error; ord.push(...r.data); }
+  for (const c of chunks(skus, 100)) { const r = await supa.from('ful_stock').select('sku,location_name,available,synced_at').in('sku', c).limit(10000); if (r.error) throw r.error; st.push(...r.data); }
+  S.attempts = att; S.events = ev;
+  S.orders = Object.fromEntries(ord.map(o => [o.order_name, o]));
+  S.stock = {}; S.stockAt = {};
+  for (const r of st) { (S.stock[r.sku] ||= {})[r.location_name] = r.available; if (!S.stockAt[r.sku] || r.synced_at > S.stockAt[r.sku]) S.stockAt[r.sku] = r.synced_at; }
+  S.loadedAt = new Date().toISOString();
+}
+
+async function act(fn, okMsg) {
+  try { await fn(); await loadAll(); render(); if (okMsg) toast(okMsg); }
+  catch (e) { console.error(e); toast('Didn’t save: ' + (e.message || e)); }
+}
+const logEvent = (line, kind, detail) => supa.from('ful_events').insert({ line_id: line.id, order_name: line.order_name, kind, detail });
+
+async function assignStore(line, locName) {
+  await act(async () => {
+    const r = await supa.from('ful_attempts').insert({ line_id: line.id, location_name: locName, status: 'wait' });
+    if (r.error) throw r.error;
+    await logEvent(line, 'store_assigned', short(locName));
+  }, `${line.order_name} → ${short(locName)}`);
+}
+async function setAttemptStatus(line, att, v) {
+  if (att.status === v) return;
+  const patch = { status: v };
+  if (['ok','bad','hold'].includes(v) && !att.replied_at) patch.replied_at = new Date().toISOString();
+  if (v === 'sent') patch.collected_at = new Date().toISOString();
+  await act(async () => {
+    const r = await supa.from('ful_attempts').update(patch).eq('id', att.id);
+    if (r.error) throw r.error;
+    await logEvent(line, 'status', `${short(att.location_name)}: ${STATUS_LABEL[v]}`);
+  });
+}
+async function setLine(line, patch, kind, detail) {
+  await act(async () => {
+    const r = await supa.from('ful_lines').update(patch).eq('id', line.id);
+    if (r.error) throw r.error;
+    if (kind) await logEvent(line, kind, detail);
+  });
+}
+// Found at HQ — from the warehouse recheck or at any later stage. Asks where it was, closes the item,
+// releases any store request still open, and offers the "no longer needed" email to that store.
+const FOUND_REASONS = [['bin','In its bin – picker missed it'], ['wrong_bin','In the wrong bin'], ['returns','In returns / receiving, not put away'], ['other','Somewhere else']];
+const FOUND_LABEL = Object.fromEntries(FOUND_REASONS);
+function openFoundAtHq(line) {
+  closeModal();
+  const att = attemptsFor(line)[0] || null;
+  const live = att && ['wait','ok','hold'].includes(att.status);
+  let reason = null;
+  const note = h('input', { class:'input', placeholder:'Optional note, e.g. found in bin C14', style:'width:100%' });
+  const save = h('button', { class:'btn primary', disabled: true }, live ? 'Save and tell the store' : 'Save');
+  const opts = h('div', { class:'pick-list', role:'radiogroup', 'aria-label':'Where was it?' }, ...FOUND_REASONS.map(([v, label]) =>
+    h('label', { class:'pick' }, h('input', { type:'radio', name:'found-reason', value: v, onchange: () => { reason = v; save.disabled = false; } }), h('div', null, label))));
+  save.addEventListener('click', async () => {
+    closeModal();
+    let released = false;
+    await act(async () => {
+      const now = new Date().toISOString();
+      const r = await supa.from('ful_lines').update({ state:'hq_found', hq_check:'found', hq_checked_at: now, hq_found_reason: reason,
+        hq_found_note: note.value.trim() || null, hq_found_qty: avail(line.sku, hqLoc()) }).eq('id', line.id);
+      if (r.error) throw r.error;
+      if (live) {
+        const r2 = await supa.from('ful_attempts').update({ status:'released' }).eq('id', att.id);
+        if (r2.error) throw r2.error;
+        released = true;
+      }
+      await logEvent(line, 'hq_found', `Found at HQ: ${FOUND_LABEL[reason]}${note.value.trim() ? ' (' + note.value.trim() + ')' : ''}${released ? ` – ${short(att.location_name)} released` : ''}`);
+    }, 'Marked as found at HQ');
+    // Only bother the store if it was actually asked
+    if (released && att.stock_mail_at) openReleaseDraft(att.location_name);
+  });
+  const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
+    h('div', { class:'modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Found at HQ' },
+      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, 'Found at HQ'), h('span', { class:'muted' }, line.order_name),
+        h('button', { class:'btn sm ghost', style:'margin-left:auto', onclick: closeModal }, 'Close')),
+      h('div', { class:'modal-body' },
+        h('div', { class:'item-name' }, line.item_name), h('div', { class:'meta' }, `${line.sku} · HQ system shows ${avail(line.sku, hqLoc())}`),
+        h('div', { class:'section-title' }, 'Where was it?'), opts, note,
+        live ? h('div', { class:'banner' }, `${short(att.location_name)} was asked for this item. It will be released${att.stock_mail_at ? ', and you can send them a short “no longer needed” email' : ''}.`) : null),
+      h('div', { class:'modal-foot' }, h('button', { class:'btn ghost', onclick: closeModal }, 'Cancel'), save)));
+  document.getElementById('modalRoot').append(bg);
+}
+// Released store requests whose "no longer needed" email hasn't gone yet, grouped by store
+function pendingReleases() {
+  const out = {};
+  for (const line of S.lines) {
+    if (line.state !== 'hq_found') continue;
+    const att = attemptsFor(line)[0];
+    if (att && att.status === 'released' && att.stock_mail_at && !att.release_mail_at) (out[att.location_name] ||= []).push({ line, att });
+  }
+  return out;
+}
+function openReleaseDraft(locName) {
+  const pairs = pendingReleases()[locName];
+  if (pairs && pairs.length) openDraft('release', locName, pairs);
+}
+
+async function hqNotFound(line) {
+  await act(async () => {
+    const hq = avail(line.sku, hqLoc());
+    let r = await supa.from('ful_lines').update({ hq_check: 'not_found', hq_checked_at: new Date().toISOString() }).eq('id', line.id);
+    if (r.error) throw r.error;
+    r = await supa.from('ful_hq_adjustments').insert({ sku: line.sku, item_name: line.item_name, order_name: line.order_name, line_id: line.id, hq_available: hq });
+    if (r.error) throw r.error;
+    await logEvent(line, 'hq_not_found', `HQ system showed ${hq}`);
+  }, 'Added to HQ stock adjustments');
+}
+
+async function callSync(body) {
+  const { data, error } = await supa.functions.invoke(CONFIG.SYNC_FUNCTION, { body: body || {} });
+  if (error) {
+    let msg = error.message;
+    try { const j = await error.context.json(); msg = j.error || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  return data;
+}
+
+// ---------- email drafts ----------
+function stockLine(items, loc) {
+  const qs = items.map(l => avail(l.sku, loc));
+  if (items.length === 1) return `Store stock says you have ${qs[0]} unit${qs[0] === 1 ? '' : 's'}.`;
+  if (qs.every(q => q === 1)) return 'Store stock says you have 1 of each.';
+  return 'Store stock says you have ' + items.map((l, i) => `${qs[i]} × ${l.item_name}`).join(', ') + '.';
+}
+function ordersPhrase(names) {
+  const u = [...new Set(names)];
+  if (u.length === 1) return 'Online order ' + u[0];
+  return 'Online orders ' + u.slice(0, -1).join(', ') + ' & ' + u[u.length - 1];
+}
+function itemTable(items) {
+  return '<table style="border-collapse:collapse"><tr>' + ['Order','SKU','Item','Qty'].map(t => `<th style="border:1px solid #bbb;padding:4px 8px;text-align:left">${t}</th>`).join('') + '</tr>' +
+    items.map(l => '<tr>' + [l.order_name, l.sku, l.item_name, l.qty].map(v => `<td style="border:1px solid #bbb;padding:4px 8px">${esc(v)}</td>`).join('') + '</tr>').join('') + '</table>';
+}
+function itemText(items) { return items.map(l => `${l.order_name} | ${l.sku} | ${l.item_name} | ${l.qty}`).join('\n'); }
+
+function draftStockCheck(locName, items) {
+  const team = short(locName);
+  const many = items.length > 1, manyOrders = new Set(items.map(l => l.order_name)).size > 1;
+  const ask = `Please check that you have the item${many ? 's' : ''} below in store and set ${many ? 'them' : 'it'} aside for ${manyOrders ? 'online orders' : 'an online order'}:`;
+  const notes = items.filter(l => l.note).map(l => `${l.order_name}: ${l.note}`);
+  const subject = 'Stock check – ' + ordersPhrase(items.map(l => l.order_name));
+  const html = `<p>Hi ${esc(team)} team,</p><p>${esc(ask)}</p>${itemTable(items)}<p>${esc(stockLine(items, locName))} Please reply today to confirm.</p>` +
+    notes.map(n => `<p>${esc(n)}</p>`).join('') + `<p>Thanks,<br>${esc(CONFIG.SIGN_OFF)}</p>`;
+  const text = `Hi ${team} team,\n\n${ask}\n\n${itemText(items)}\n\n${stockLine(items, locName)} Please reply today to confirm.\n\n` + notes.map(n => n + '\n\n').join('') + `Thanks,\n${CONFIG.SIGN_OFF}`;
+  return { to: S.locByName[locName]?.email || '', subject, html, text };
+}
+function draftCollection(locName, items) {
+  const team = short(locName);
+  const o = S.orders[items[0].order_name] || {};
+  const addr = [o.customer_name + (o.company ? ', ' + o.company : ''), [o.address1, o.address2].filter(Boolean).join(', '), [o.city, o.province, o.zip].filter(Boolean).join(', '), o.phone].filter(Boolean);
+  const subject = `Aramex collection today – Online order ${items[0].order_name}${o.customer_name ? ' – ' + o.customer_name : ''}`;
+  const html = `<p>Hi ${esc(team)} team,</p><p>Thanks for confirming. Please keep the item${items.length > 1 ? 's' : ''} below aside for <b>Aramex collection today</b>:</p>${itemTable(items)}` +
+    `<p><b>Deliver to:</b><br>${addr.map(esc).join('<br>')}</p><p>Please pack it, mark the parcel with the order number and customer name, and have it ready at the till for the driver.</p><p>Thanks,<br>${esc(CONFIG.SIGN_OFF)}</p>`;
+  const text = `Hi ${team} team,\n\nThanks for confirming. Please keep the item${items.length > 1 ? 's' : ''} below aside for Aramex collection today:\n\n${itemText(items)}\n\nDeliver to:\n${addr.join('\n')}\n\nPlease pack it, mark the parcel with the order number and customer name, and have it ready at the till for the driver.\n\nThanks,\n${CONFIG.SIGN_OFF}`;
+  return { to: S.locByName[locName]?.email || '', subject, html, text };
+}
+
+function draftRelease(locName, items, pairs) {
+  const team = short(locName);
+  const many = items.length > 1;
+  const booked = pairs.some(p => p.att.collect_mail_at);
+  const subject = 'No longer needed – ' + ordersPhrase(items.map(l => l.order_name));
+  const lead = `Good news – we found the item${many ? 's' : ''} below at the warehouse, so you don’t need to keep ${many ? 'them' : 'it'} aside any more. Please put ${many ? 'them' : 'it'} back on the shelf.`;
+  const aramex = booked ? 'Please don’t hand anything for these orders to Aramex.' : '';
+  const html = `<p>Hi ${esc(team)} team,</p><p>${esc(lead)}</p>${itemTable(items)}${aramex ? `<p><b>${esc(aramex)}</b></p>` : ''}<p>Thanks for checking,<br>${esc(CONFIG.SIGN_OFF)}</p>`;
+  const text = `Hi ${team} team,\n\n${lead}\n\n${itemText(items)}\n\n${aramex ? aramex + '\n\n' : ''}Thanks for checking,\n${CONFIG.SIGN_OFF}`;
+  return { to: S.locByName[locName]?.email || '', subject, html, text };
+}
+const DRAFT_KINDS = {
+  stock:   { title:'Stock check email',  field:'stock_mail_at',   event:'stock_mail',   make: (loc, items) => draftStockCheck(loc, items) },
+  collect: { title:'Collection email',   field:'collect_mail_at', event:'collect_mail', make: (loc, items) => draftCollection(loc, items) },
+  release: { title:'No longer needed email', field:'release_mail_at', event:'release_mail', make: (loc, items, pairs) => draftRelease(loc, items, pairs) },
+};
+
+async function copyRich(html, text) {
+  try {
+    await navigator.clipboard.write([new ClipboardItem({ 'text/html': new Blob([html], { type:'text/html' }), 'text/plain': new Blob([text], { type:'text/plain' }) })]);
+  } catch (e) { await navigator.clipboard.writeText(text); }
+}
+function openDraft(kind, locName, pairs) {
+  const items = pairs.map(p => p.line);
+  const K = DRAFT_KINDS[kind];
+  const d = K.make(locName, items, pairs);
+  const field = (label, val) => h('div', { class:'field' }, h('label', null, label), h('div', { class:'val' }, val || '—'),
+    h('button', { class:'btn sm', onclick: () => navigator.clipboard.writeText(val).then(() => toast(label + ' copied')) }, 'Copy'));
+  const preview = h('div', { class:'preview' }); preview.innerHTML = d.html;
+  const field2 = K.field;
+  closeModal();
+  const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
+    h('div', { class:'modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Email draft' },
+      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, K.title), h('span', { class:'muted' }, short(locName)),
+        h('button', { class:'btn sm ghost', style:'margin-left:auto', onclick: closeModal }, 'Close')),
+      h('div', { class:'modal-body' },
+        d.to ? null : h('div', { class:'banner' }, `No email address saved for ${short(locName)} yet. Add it on the Stores tab.`),
+        field('To', d.to), field('Subject', d.subject), preview),
+      h('div', { class:'modal-foot' },
+        h('button', { class:'btn', onclick: () => copyRich(d.html, d.text).then(() => toast('Email body copied. Paste it into Outlook.')) }, 'Copy email body'),
+        h('button', { class:'btn gold', onclick: async () => {
+          closeModal();
+          await act(async () => {
+            const now = new Date().toISOString();
+            const r = await supa.from('ful_attempts').update({ [field2]: now }).in('id', pairs.map(p => p.att.id));
+            if (r.error) throw r.error;
+            for (const p of pairs) await logEvent(p.line, K.event, short(locName));
+          }, 'Marked as sent');
+        } }, 'Mark as sent'))));
+  document.getElementById('modalRoot').append(bg);
+}
+function closeModal() { document.getElementById('modalRoot').textContent = ''; }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// ---------- add short pick ----------
+function openAddShortPick() {
+  closeModal();
+  const input = h('input', { class:'input', placeholder:'Order number, e.g. 307000', style:'flex:1' });
+  const out = h('div', { class:'pick-list' });
+  const status = h('div');
+  const manualSku = h('input', { class:'input', placeholder:'SKU' });
+  const manualName = h('input', { class:'input', placeholder:'Item name', style:'flex:1' });
+  let fetched = null;
+
+  async function lookup() {
+    const name = normOrder(input.value);
+    if (!name) return;
+    status.replaceChildren(h('div', { class:'muted' }, 'Looking up ' + name + ' in Shopify…'));
+    out.textContent = ''; fetched = null;
+    try {
+      fetched = await callSync({ order: name });
+      status.textContent = '';
+      for (const li of fetched.lines) {
+        if (!li.sku) continue;
+        const already = S.lines.some(l => l.order_name === fetched.order && l.sku === li.sku);
+        const hq = (li.stock.find(s => s.location === hqLoc()) || {}).available || 0;
+        const stores = li.stock.filter(s => S.locByName[s.location]?.sourceable && !S.locByName[s.location]?.is_hq).length;
+        out.append(h('label', { class:'pick' },
+          h('input', { type:'checkbox', value: li.sku, disabled: already || li.current === 0 }),
+          h('div', null, h('div', { class:'item-name' }, li.name),
+            h('div', { class:'meta' }, `${li.sku} · qty ${li.quantity} · unfulfilled ${li.unfulfilled}${li.current === 0 ? ' · refunded' : ''}${already ? ' · already on the board' : ''}`),
+            h('div', { class:'stock-row' }, h('span', null, 'HQ ', h('b', null, String(hq))), h('span', null, `${stores} store${stores === 1 ? '' : 's'} with stock`)))));
+      }
+    } catch (e) {
+      status.replaceChildren(h('div', { class:'banner' }, `Couldn’t reach Shopify (${e.message}). Add the item by SKU below instead.`));
+    }
+  }
+  async function save() {
+    const name = normOrder(input.value);
+    const picked = fetched ? [...out.querySelectorAll('input:checked')].map(i => fetched.lines.find(l => l.sku === i.value)) : [];
+    const rows = picked.map(li => ({ order_name: fetched.order, sku: li.sku, item_name: li.name.replace(/ - /g, ' – '), qty: Math.max(1, li.unfulfilled || li.quantity || 1) }));
+    if (manualSku.value.trim()) rows.push({ order_name: name, sku: manualSku.value.trim(), item_name: manualName.value.trim() || manualSku.value.trim(), qty: 1 });
+    if (!name || !rows.length) { toast('Pick at least one item'); return; }
+    closeModal();
+    await act(async () => {
+      if (!S.orders[name] && !fetched) { const r = await supa.from('ful_orders').upsert({ order_name: name }, { onConflict:'order_name', ignoreDuplicates:true }); if (r.error) throw r.error; }
+      for (const row of rows) {
+        const hq = avail(row.sku, hqLoc()) || ((fetched?.lines.find(l => l.sku === row.sku)?.stock || []).find(s => s.location === hqLoc())?.available || 0);
+        const r = await supa.from('ful_lines').insert({ ...row, hq_check: hq > 0 ? 'pending' : null, source: 'manual' }).select().single();
+        if (r.error) throw r.error;
+        await logEvent(r.data, 'added', hq > 0 ? `Short-picked. HQ system shows ${hq}` : 'Short-picked');
+      }
+    }, `${rows.length} item${rows.length === 1 ? '' : 's'} added`);
+  }
+
+  const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
+    h('div', { class:'modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Add short pick' },
+      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, 'Add short-picked items'),
+        h('button', { class:'btn sm ghost', style:'margin-left:auto', onclick: closeModal }, 'Close')),
+      h('div', { class:'modal-body' },
+        h('form', { class:'search', onsubmit: e => { e.preventDefault(); lookup(); } }, input, h('button', { class:'btn', type:'submit' }, 'Look up')),
+        status, out,
+        h('div', { class:'section-title' }, 'Or add by SKU'),
+        h('div', { class:'search' }, manualSku, manualName)),
+      h('div', { class:'modal-foot' }, h('button', { class:'btn gold', onclick: save }, 'Add to sourcing'))));
+  document.getElementById('modalRoot').append(bg);
+  input.focus();
+}
+
+// ---------- views ----------
+function renderTabs() {
+  const openCount = S.lines.filter(l => isOpenStage(stageOf(l).key)).length;
+  const adjOpen = S.adjustments.filter(a => !a.resolved_at).length;
+  const tabs = [
+    ['board', 'Sourcing', openCount],
+    ['lookup', 'Order lookup'],
+    ['adjust', 'HQ stock adjustments', adjOpen],
+    ...(isAdmin() ? [['stores', 'Stores']] : []),
+  ];
+  document.getElementById('tabs').replaceChildren(...tabs.map(([k, label, n]) =>
+    h('button', { class:'tab', role:'tab', 'aria-selected': String(S.view === k), onclick: () => { S.view = k; render(); } }, label, n ? h('span', { class:'n' }, n) : null)));
+}
+
+// Stock as small labelled counters: HQ, the store being asked, and how many other stores have it
+function stockSummary(line, focusLoc) {
+  const hq = avail(line.sku, hqLoc());
+  const others = S.locations.filter(l => l.sourceable && !l.is_hq && avail(line.sku, l.name) > 0);
+  const stat = (label, val, cls) => h('div', { class:'mini ' + (cls || '') }, h('span', { class:'mini-l' }, label), h('span', { class:'mini-v' }, String(val)));
+  return h('div', null,
+    h('div', { class:'minis' },
+      stat('HQ', hq, hq > 0 ? 'warn' : ''),
+      focusLoc ? stat(short(focusLoc), avail(line.sku, focusLoc)) : null,
+      stat('Stores with stock', others.length)),
+    S.stockAt[line.sku] ? h('div', { class:'dim xs' }, 'Stock as of ' + when(S.stockAt[line.sku])) : null);
+}
+// Email trail as a short checklist, one row each
+function mailLine(att) {
+  if (!att) return null;
+  const row = (label, t, pending) => h('li', { class: t ? 'done' : '' }, h('span', { class:'dot', 'aria-hidden':'true' }), h('span', { class:'ml' }, label),
+    h('span', { class:'mv' }, t ? when(t) : pending));
+  return h('ul', { class:'checklist' },
+    row('Stock check emailed', att.stock_mail_at, 'Not yet'),
+    row('Store replied', att.replied_at, 'Waiting'),
+    row('Collection emailed', att.collect_mail_at, 'Not yet'),
+    att.collected_at ? row('Collected', att.collected_at, '') : null);
+}
+const STAGE_RANK = { bad:0, new:1, hq_check:2, wait:3, hold:4, ok:5, sent:6, hq:7, refund:8, cancelled:9 };
+// Item layout used in every tile: name + status on top, then details; actions pinned to the bottom edge so
+// tiles in the same row line up.
+function itemBlock(line, st, parts, ...actions) {
+  const acts = actions.filter(Boolean);
+  return h('div', { class:'item' },
+    h('div', { class:'item-top' }, h('div', { class:'item-name' }, line.item_name), h('span', { class:'badge b-' + st.key }, parts.badge || st.label)),
+    h('div', { class:'meta' }, parts.meta),
+    ...(parts.extra || []),
+    line.note ? h('div', { class:'note' }, line.note) : null,
+    parts.stock || null,
+    parts.mails || null,
+    acts.length ? h('div', { class:'item-actions' }, ...acts) : null);
+}
+const fact = (label, value) => h('div', { class:'fact' }, h('span', { class:'fact-l' }, label), h('span', { class:'fact-v' }, value));
+
+const MAIL_ACTION_LABEL = a => ({ stock_mail:'mark stock check emailed', collect_mail:'mark collection emailed', 'status:ok':'store has stock',
+  'status:bad':'store has no stock', 'status:hold':'put on hold', collected:'mark collected' })[a] || a;
+async function reviewFlag(f, accept) {
+  await act(async () => {
+    const { data, error } = await supa.rpc('ful_mail_review', { p_message_id: f.message_id, p_accept: accept });
+    if (error) throw error;
+    if (accept && String(data).startsWith('flagged')) toast('No matching open item on the board – check the email');
+  }, accept ? 'Applied' : 'Dismissed');
+}
+
+// Board categories, in working order. Each item sits in exactly one.
+const CATEGORIES = [
+  { key:'hq_check', title:'Warehouse recheck', sub:'HQ shows stock' },
+  { key:'need',     title:'Needs a store',     sub:'Pick a store' },
+  { key:'to_check', title:'Stock check to send', sub:'Email the store' },
+  { key:'waiting',  title:'Waiting for store', sub:'Stock check sent' },
+  { key:'to_book',  title:'Book collection',   sub:'Store has it' },
+  { key:'aramex',   title:'Awaiting Aramex',   sub:'Collection emailed' },
+  { key:'hold',     title:'On hold',           sub:'Needs a decision' },
+  { key:'done',     title:'Collected',         sub:'Last 7 days' },
+];
+function categoryOf(st) {
+  const a = st.att;
+  switch (st.key) {
+    case 'hq_check': return 'hq_check';
+    case 'new': case 'bad': return 'need';
+    case 'wait': return a.stock_mail_at ? 'waiting' : 'to_check';
+    case 'ok': return a.collect_mail_at ? 'aramex' : 'to_book';
+    case 'hold': return 'hold';
+    case 'sent': return a.collected_at && Date.now() - new Date(a.collected_at) < 7 * 864e5 ? 'done' : null;
+    default: return null;   // found at HQ, refund, cancelled: off the board (still in Order lookup)
+  }
+}
+
+function replyPills(line, st) {
+  if (!isAdmin() || !st.att) return null;
+  return h('div', { class:'pills', role:'group', 'aria-label':'Store reply' }, ...['wait','ok','bad','hold','sent'].map(v =>
+    h('button', { 'data-v': v, 'aria-pressed': String(st.att.status === v), onclick: () => setAttemptStatus(line, st.att, v) }, STATUS_LABEL[v])));
+}
+
+function itemTile(x, items) {
+  const { line, st } = x;
+  const o = S.orders[line.order_name] || {};
+  const loc = st.att?.location_name;
+  const meta = `${line.order_name} · ${line.sku} · qty ${line.qty}`;
+  const where = h('div', { class:'where' },
+    loc ? h('span', null, 'Store ', h('b', null, short(loc))) : null,
+    h('span', null, 'Ships to ', h('b', null, [o.city, o.province_code].filter(Boolean).join(', ') || 'unknown')));
+  let actions = [];
+  if (x.cat === 'hq_check') {
+    if (isAdmin()) actions = [h('div', { class:'actions' },
+      h('button', { class:'btn primary sm', onclick: () => openFoundAtHq(line) }, 'Found at HQ'),
+      h('button', { class:'btn outline sm', onclick: () => hqNotFound(line) }, 'Not found'))];
+    return h('section', { class:'tile' }, itemBlock(line, st, { badge:`HQ shows ${avail(line.sku, hqLoc())}`, meta, extra:[where], stock: stockSummary(line) }, ...actions));
+  }
+  if (x.cat === 'need') {
+    const sug = suggestStores(line);
+    actions = [
+      h('div', { class:'chips' }, sug.length ? sug.map((s, i) => isAdmin()
+        ? h('button', { class:'chip' + (i === 0 ? ' best' : ''), title: s.covers ? `Can also supply ${s.covers} other item(s) on this order` : null, onclick: () => assignStore(line, s.loc.name) }, (i === 0 ? '★ ' : '') + s.loc.short_name, h('span', { class:'q' }, s.qty))
+        : h('span', { class:'chip static' + (i === 0 ? ' best' : '') }, s.loc.short_name, h('span', { class:'q' }, s.qty)))
+        : h('span', { class:'note' }, 'No store has stock. Refund, or offer a swap.')),
+      isAdmin() ? h('div', { class:'actions' },
+        h('button', { class:'btn ghost sm', onclick: () => openFoundAtHq(line) }, 'Found at HQ'),
+        h('button', { class:'btn ghost sm', onclick: () => { if (confirm(`Mark ${line.order_name} – ${line.item_name} for refund?`)) setLine(line, { state:'refund' }, 'refund', 'Marked for refund'); } }, 'Mark for refund')) : null];
+    const extra = [where, st.key === 'bad' ? h('div', { class:'note' }, `${short(loc)} had no stock`) : null];
+    return h('section', { class:'tile' }, itemBlock(line, st, { meta, extra, stock: stockSummary(line) }, ...actions));
+  }
+  // Store categories: the email button drafts for every item at the same store in the same step
+  if (isAdmin() && x.cat === 'to_check') {
+    const batch = items.filter(y => y.cat === 'to_check' && y.st.att.location_name === loc);
+    actions.push(h('button', { class:'btn primary sm block', onclick: () => openDraft('stock', loc, batch.map(y => ({ line:y.line, att:y.st.att }))) },
+      `Stock check email · ${short(loc)}${batch.length > 1 ? ` (${batch.length} items)` : ''}`));
+  }
+  if (isAdmin() && x.cat === 'to_book') {
+    const batch = items.filter(y => y.cat === 'to_book' && y.st.att.location_name === loc && y.line.order_name === line.order_name);
+    actions.push(h('button', { class:'btn primary sm block', onclick: () => openDraft('collect', loc, batch.map(y => ({ line:y.line, att:y.st.att }))) },
+      `Collection email · ${line.order_name}${batch.length > 1 ? ` (${batch.length} items)` : ''}`));
+  }
+  actions.push(replyPills(line, st));
+  if (isAdmin() && x.cat !== 'done') actions.push(h('button', { class:'btn ghost sm', style:'align-self:flex-start', onclick: () => openFoundAtHq(line) }, 'Found at HQ'));
+  return h('section', { class:'tile' }, itemBlock(line, st, { meta, extra:[where], stock: stockSummary(line, loc), mails: mailLine(st.att) }, ...actions));
+}
+
+function renderBoard(main) {
+  const items = S.lines.map(l => { const st = stageOf(l); return { line: l, st, cat: categoryOf(st) }; }).filter(x => x.cat);
+  const counts = Object.fromEntries(CATEGORIES.map(c => [c.key, items.filter(x => x.cat === c.key).length]));
+  if (!S.cat || (!counts[S.cat] && S.cat !== 'done')) S.cat = (CATEGORIES.find(c => c.key !== 'done' && counts[c.key]) || CATEGORIES[0]).key;
+
+  main.append(h('div', { class:'page-head' },
+    h('div', null, h('div', { class:'page-title' }, 'Sourcing'), h('div', { class:'page-sub' }, 'Short-picked online items being sourced from HQ or stores.')),
+    h('div', { class:'page-actions' },
+      isAdmin() ? h('button', { class:'btn', onclick: async e => {
+        e.target.disabled = true;
+        try {
+          const r = await callSync({});
+          const warn = (r.warnings || []).length ? ` Shopify held back some fields: ${r.warnings.join(' ')}` : '';
+          S.syncMsg = { ok: !warn, text:`Synced ${r.orders} orders from Shopify at ${when(r.at)}.${warn}` };
+          await loadAll();
+        }
+        catch (err) { S.syncMsg = { ok:false, text:'Shopify sync failed: ' + err.message }; }
+        render();
+      } }, 'Sync Shopify') : null,
+      h('button', { class:'btn', onclick: () => act(async () => {}, 'Refreshed') }, 'Refresh'),
+      isAdmin() ? h('button', { class:'btn primary', onclick: openAddShortPick }, '+ Add short pick') : null)));
+  if (S.syncMsg) main.append(h('div', { class:'banner ' + (S.syncMsg.ok ? 'ok' : 'err') }, S.syncMsg.text));
+  if (S.lastSync) main.append(h('div', { class: S.lastSync.ok ? 'dim sm' : 'banner err' },
+    S.lastSync.ok
+      ? `Shopify data last updated ${when(S.lastSync.at)} (${S.lastSync.trigger === 'auto' ? 'automatic' : 'manual'} sync). Updates every 20 minutes, 07:00–18:40 Mon–Sat.`
+      : `Last Shopify sync failed at ${when(S.lastSync.at)}: ${S.lastSync.detail || 'unknown error'}`));
+
+  if (S.lastScan) main.append(h('div', { class:'dim sm', style:'margin-top:-14px' }, `Email scan last ran ${when(S.lastScan)}. Store confirmations update the board automatically, hourly.`));
+
+  // Items found at HQ while a store had already been asked: send that store a "no longer needed" email
+  const releases = Object.entries(pendingReleases());
+  if (releases.length) {
+    main.append(h('section', { class:'tile flags' },
+      h('header', { class:'tile-head' },
+        h('div', null, h('div', { class:'tile-title' }, 'Let these stores know'), h('div', { class:'muted sm' }, 'Found at HQ after the store was asked. Tell the store it can put the item back on the shelf.')),
+        h('span', { class:'badge b-wait' }, String(releases.reduce((n, [, p]) => n + p.length, 0)))),
+      ...releases.map(([loc, pairs]) => h('div', { class:'flag' },
+        h('div', { class:'flag-main' }, h('div', { class:'item-name' }, short(loc)),
+          h('div', { class:'meta' }, pairs.map(p => `${p.line.order_name} · ${p.line.item_name}`).join(' | '))),
+        isAdmin() ? h('div', { class:'actions' }, h('button', { class:'btn primary sm', onclick: () => openReleaseDraft(loc) }, 'No longer needed email')) : null))));
+  }
+
+  // Emails the hourly scan couldn't safely apply on its own
+  if ((S.mailFlags || []).length) {
+    main.append(h('section', { class:'tile flags' },
+      h('header', { class:'tile-head' },
+        h('div', null, h('div', { class:'tile-title' }, 'Check these emails'), h('div', { class:'muted sm' }, 'The email scan wasn’t sure what to do with these. Apply the suggestion, or dismiss it.')),
+        h('span', { class:'badge b-wait' }, String(S.mailFlags.length))),
+      ...S.mailFlags.map(f => h('div', { class:'flag' },
+        h('div', { class:'flag-main' },
+          h('div', { class:'item-name' }, f.summary || f.subject || 'Email'),
+          h('div', { class:'meta' }, [f.location_name ? short(f.location_name) : f.sender, (f.order_names || []).join(', '), when(f.received_at)].filter(Boolean).join(' · ')),
+          f.action ? h('div', { class:'muted sm' }, 'Suggested: ' + MAIL_ACTION_LABEL(f.action)) : null),
+        h('div', { class:'actions' },
+          /^https:\/\/outlook\.(office365|office)\.com\//.test(f.web_link || '') ? h('a', { class:'btn outline sm', href: f.web_link, target:'_blank', rel:'noopener noreferrer' }, 'Open email') : null,
+          isAdmin() && f.action && (f.order_names || []).length ? h('button', { class:'btn primary sm', onclick: () => reviewFlag(f, true) }, 'Apply') : null,
+          isAdmin() ? h('button', { class:'btn ghost sm', onclick: () => reviewFlag(f, false) }, 'Dismiss') : null)))));
+  }
+
+  // Category tiles: one even row; click to show that category below
+  main.append(h('div', { class:'cats', role:'tablist', 'aria-label':'Categories' }, ...CATEGORIES.map(c =>
+    h('button', { class:'cat' + (counts[c.key] ? '' : ' empty-cat'), role:'tab', 'aria-selected': String(S.cat === c.key), onclick: () => { S.cat = c.key; render(); } },
+      h('span', { class:'cat-v' }, String(counts[c.key])),
+      h('span', { class:'cat-t' }, c.title),
+      h('span', { class:'cat-s' }, c.sub)))));
+
+  const cat = CATEGORIES.find(c => c.key === S.cat);
+  const shown = items.filter(x => x.cat === S.cat)
+    .sort((a, b) => short(a.st.att?.location_name || '').localeCompare(short(b.st.att?.location_name || '')) || a.line.order_name.localeCompare(b.line.order_name));
+  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, cat.title, h('span', { class:'count' }, shown.length)))));
+  if (!shown.length) { main.append(h('div', { class:'empty' }, 'Nothing here right now.')); return; }
+  main.append(h('div', { class:'grid even' }, ...shown.map(x => itemTile(x, items))));
+}
+
+function renderLookup(main) {
+  main.append(h('div', { class:'page-head' }, h('div', null, h('div', { class:'page-title' }, 'Order lookup'),
+    h('div', { class:'page-sub' }, 'Search an online order to see where each short-picked item is coming from, store stock, and which emails have gone out.'))));
+  const input = h('input', { class:'input', type:'search', id:'q', placeholder:'Order number, customer, SKU or item', value: S.query, 'aria-label':'Search orders',
+    oninput: e => { S.query = e.target.value; drawResults(); } });
+  const seg = h('div', { class:'toggle', role:'group', 'aria-label':'Show' }, ...[[false,'All'],[true,'Still open']].map(([v, l]) =>
+    h('button', { 'aria-pressed': String(S.lookupOpenOnly === v), onclick: () => { S.lookupOpenOnly = v; render(); } }, l)));
+  main.append(h('div', { class:'search' }, input, seg));
+  const res = h('div', { class:'grid wide' });
+  main.append(res);
+
+  function drawResults() {
+    const q = S.query.trim().toLowerCase();
+    const qNum = q.replace(/^fom\s*/, '').replace(/^#/, '');
+    const groups = {};
+    for (const line of S.lines) (groups[line.order_name] ||= []).push(line);
+    let orders = Object.entries(groups).map(([name, lines]) => ({ name, lines, o: S.orders[name] || {}, sts: lines.map(stageOf) }));
+    if (q) orders = orders.filter(({ name, lines, o }) =>
+      name.toLowerCase().includes(qNum || q) || (o.customer_name || '').toLowerCase().includes(q) ||
+      lines.some(l => l.sku.includes(q) || (l.item_name || '').toLowerCase().includes(q)));
+    if (S.lookupOpenOnly) orders = orders.filter(x => x.sts.some(s => isOpenStage(s.key)));
+    orders.sort((a, b) => b.lines[0].added_at.localeCompare(a.lines[0].added_at));
+    res.textContent = '';
+    res.append(h('div', { class:'muted full' }, `${orders.length} order${orders.length === 1 ? '' : 's'}${q ? ` matching “${S.query.trim()}”` : ''}`));
+    if (!orders.length) { res.append(h('div', { class:'empty full' }, q ? 'Nothing on the sourcing list matches. If an order isn’t here, none of its items are being sourced from a store.' : 'No orders yet.')); return; }
+    for (const { name, lines, o, sts } of orders.slice(0, 60)) {
+      const worst = sts.map(s => s.key).sort((a, b) => STAGE_RANK[a] - STAGE_RANK[b])[0];
+      const card = h('section', { class:'tile' },
+        h('header', { class:'tile-head' },
+          h('div', null, h('div', { class:'tile-title mono' }, name), h('div', { class:'muted sm' }, o.customer_name || '')),
+          h('span', { class:'badge b-' + worst }, isOpenStage(worst) ? 'In progress' : 'Done')),
+        h('div', { class:'facts' },
+          o.city ? fact('Ships to', [o.city, o.province_code].filter(Boolean).join(', ')) : null,
+          o.fulfillment_status ? fact('Shopify', o.fulfillment_status.toLowerCase().replace(/_/g, ' ')) : null,
+          o.financial_status ? fact('Payment', o.financial_status.toLowerCase().replace(/_/g, ' ')) : null,
+          o.tracking_numbers?.length ? fact('Waybill', o.tracking_numbers.join(', ')) : null));
+      lines.forEach((line, i) => {
+        const st = sts[i];
+        const atts = attemptsFor(line);
+        const evs = S.events.filter(e => e.line_id === line.id);
+        const tl = [];
+        tl.push([line.added_at, 'Added to sourcing']);
+        for (const a of [...atts].reverse()) {
+          tl.push([a.created_at, `Asked ${short(a.location_name)}`]);
+          if (a.stock_mail_at) tl.push([a.stock_mail_at, `Stock check email sent to ${short(a.location_name)}`]);
+          if (a.replied_at) tl.push([a.replied_at, `${short(a.location_name)} replied` + (['ok','bad','hold'].includes(a.status) ? `: ${STATUS_LABEL[a.status]}` : a.status === 'sent' ? ': Has stock' : '')]);
+          if (a.release_mail_at) tl.push([a.release_mail_at, `“No longer needed” email sent to ${short(a.location_name)}`]);
+          if (a.collect_mail_at) tl.push([a.collect_mail_at, `Collection email sent to ${short(a.location_name)}`]);
+          if (a.collected_at) tl.push([a.collected_at, `Collected from ${short(a.location_name)}`]);
+        }
+        for (const e of evs) if (['hq_found','hq_not_found','refund','email'].includes(e.kind)) tl.push([e.at,
+          e.kind === 'hq_found' ? 'Found at HQ' : e.kind === 'refund' ? 'Marked for refund' : e.kind === 'email' ? (e.detail || 'Updated from email') : 'Not found at HQ (' + (e.detail || '') + ')']);
+        tl.sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+        card.append(h('div', { class:'sub' },
+          itemBlock(line, st, {
+            meta: `${line.sku} · qty ${line.qty}${st.att ? ' · sourcing from ' + short(st.att.location_name) : ''}`,
+            extra: [h('div', { class:'say' }, sayFor(line, st))],
+            stock: stockSummary(line, st.att?.location_name), mails: mailLine(st.att),
+          },
+            h('details', { class:'history' }, h('summary', null, 'History'),
+              h('ul', { class:'timeline' }, ...tl.map(([t, txt]) => h('li', null, h('time', null, when(t)), txt)))))));
+      });
+      res.append(card);
+    }
+  }
+  drawResults();
+  if (S.focusSearch) { input.focus(); S.focusSearch = false; }
+}
+
+function renderAdjust(main) {
+  main.append(h('div', { class:'page-head' }, h('div', null, h('div', { class:'page-title' }, 'HQ stock adjustments'),
+    h('div', { class:'page-sub' }, 'What the warehouse recheck turned up: SKUs HQ’s system shows but nobody could find, and short picks that were at HQ after all.'))));
+
+  // Found on recheck: why the picker missed it
+  const found = S.lines.filter(l => l.state === 'hq_found').sort((a, b) => String(b.hq_checked_at).localeCompare(String(a.hq_checked_at)));
+  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Found on recheck', h('span', { class:'count' }, found.length)),
+    h('p', { class:'muted sm' }, `Short picks that were at HQ after all, last ${CONFIG.LOOKBACK_DAYS} days. Shows where pick misses come from.`))));
+  main.append(h('div', { class:'cats' }, ...FOUND_REASONS.map(([k, label]) =>
+    h('div', { class:'cat static-cat' }, h('span', { class:'cat-v' }, String(found.filter(l => l.hq_found_reason === k).length)), h('span', { class:'cat-t' }, label)))));
+  if (found.length) {
+    const ft = h('table', { class:'plain' }, h('tr', null, ...['Found','SKU','Item','Order','Where it was','Note','HQ showed'].map(t => h('th', null, t))));
+    for (const l of found) ft.append(h('tr', null,
+      h('td', { class:'mono' }, when(l.hq_checked_at)), h('td', { class:'mono' }, l.sku), h('td', null, l.item_name || ''), h('td', { class:'mono' }, l.order_name),
+      h('td', null, FOUND_LABEL[l.hq_found_reason] || 'Not recorded'), h('td', null, l.hq_found_note || ''), h('td', { class:'mono' }, l.hq_found_qty ?? '')));
+    main.append(h('div', { class:'card', style:'overflow-x:auto' }, ft));
+  }
+
+  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Not found – adjust stock', h('span', { class:'count' }, S.adjustments.filter(a => !a.resolved_at).length)),
+    h('p', { class:'muted sm' }, 'HQ’s system showed stock but the warehouse couldn’t find it. These need a stock adjustment.'))));
+  if (!S.adjustments.length) { main.append(h('div', { class:'empty' }, 'Nothing logged yet.')); return; }
+  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Reported','SKU','Item','Order','HQ showed','Status',''].map(t => h('th', null, t))));
+  for (const a of S.adjustments) tbl.append(h('tr', null,
+    h('td', { class:'mono' }, when(a.reported_at)), h('td', { class:'mono' }, a.sku), h('td', null, a.item_name || ''), h('td', { class:'mono' }, a.order_name || ''),
+    h('td', { class:'mono' }, String(a.hq_available ?? '')),
+    h('td', null, a.resolved_at ? h('span', { class:'badge b-sent' }, 'Adjusted ' + when(a.resolved_at)) : h('span', { class:'badge b-wait' }, 'To adjust')),
+    h('td', null, isAdmin() && !a.resolved_at ? h('button', { class:'btn sm', onclick: () => act(async () => {
+      const r = await supa.from('ful_hq_adjustments').update({ resolved_at: new Date().toISOString(), resolution: 'Adjusted' }).eq('id', a.id); if (r.error) throw r.error;
+    }, 'Marked adjusted') }, 'Mark adjusted') : null)));
+  main.append(h('div', { class:'card', style:'overflow-x:auto' }, tbl));
+}
+
+function renderStores(main) {
+  main.append(h('div', { class:'page-head' }, h('div', null, h('div', { class:'page-title' }, 'Stores'),
+    h('div', { class:'page-sub' }, 'Email addresses used on drafts, the province used for "closest store", and which locations can be suggested.'))));
+  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Location','Province','City','Email','Suggest',''].map(t => h('th', null, t))));
+  for (const l of S.locations) {
+    const email = h('input', { class:'input', value: l.email || '', style:'width:100%', type:'email', 'aria-label':'Email for ' + l.name });
+    const prov = h('select', { class:'input', 'aria-label':'Province for ' + l.name }, ...Object.keys(PROV_NEAR).map(p => h('option', { value:p, selected: l.province_code === p }, p === 'NL' ? 'NL (KZN)' : p)));
+    const city = h('input', { class:'input', value: l.city || '', style:'width:100%', 'aria-label':'City for ' + l.name });
+    const sug = h('input', { type:'checkbox', checked: l.sourceable, 'aria-label':'Suggest ' + l.name });
+    tbl.append(h('tr', null, h('td', null, l.name, l.is_hq ? h('span', { class:'badge b-sent', style:'margin-left:6px' }, 'HQ') : null), h('td', null, prov), h('td', null, city), h('td', null, email), h('td', null, sug),
+      h('td', null, h('button', { class:'btn sm', onclick: () => act(async () => {
+        const r = await supa.from('ful_locations').update({ email: email.value.trim() || null, province_code: prov.value, city: city.value.trim() || null, sourceable: sug.checked }).eq('name', l.name);
+        if (r.error) throw r.error;
+      }, 'Saved ' + l.short_name) }, 'Save'))));
+  }
+  main.append(h('div', { class:'card', style:'overflow-x:auto' }, tbl));
+}
+
+function render() {
+  renderTabs();
+  const main = document.getElementById('main');
+  const hadFocus = document.activeElement?.id === 'q';
+  main.textContent = '';
+  if (S.view === 'lookup') renderLookup(main);
+  else if (S.view === 'adjust') renderAdjust(main);
+  else if (S.view === 'stores' && isAdmin()) renderStores(main);
+  else renderBoard(main);
+  if (hadFocus) { const q = document.getElementById('q'); if (q) { q.focus(); q.setSelectionRange(q.value.length, q.value.length); } }
+}
+
+// ---------- auth ----------
+async function start(session) {
+  if (!session) { document.getElementById('appView').hidden = true; document.getElementById('loginView').hidden = false; return; }
+  S.userId = session.user.id; S.email = session.user.email;
+  const { data: role } = await supa.rpc('ful_role');
+  if (!role) {
+    document.getElementById('loginView').hidden = false; document.getElementById('appView').hidden = true;
+    const m = document.getElementById('loginMsg'); m.hidden = false; m.textContent = 'You’re signed in, but your account isn’t set up for fulfilment yet. Ask Musa to add you.';
+    return;
+  }
+  S.role = role;
+  if (role !== 'admin') S.view = 'lookup';
+  const hash = decodeURIComponent(location.hash.slice(1));
+  if (hash) { S.view = 'lookup'; S.query = hash; }
+  document.getElementById('whoEmail').textContent = S.email;
+  document.getElementById('whoRole').textContent = role === 'admin' ? 'Admin' : 'Read only';
+  document.getElementById('loginView').hidden = true; document.getElementById('appView').hidden = false;
+  try { await loadAll(); } catch (e) { console.error(e); toast('Couldn’t load: ' + e.message); }
+  render();
+}
+document.getElementById('loginForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const m = document.getElementById('loginMsg'); m.hidden = true;
+  const { data, error } = await supa.auth.signInWithPassword({ email: document.getElementById('loginEmail').value.trim(), password: document.getElementById('loginPass').value });
+  if (error) { m.hidden = false; m.textContent = 'Sign-in failed: ' + error.message; return; }
+  start(data.session);
+});
+document.getElementById('signOut').addEventListener('click', async () => { await supa.auth.signOut(); location.reload(); });
+supa.auth.getSession().then(({ data }) => start(data.session));
+// Keep the board fresh while it's open
+setInterval(() => {
+  const busy = document.getElementById('modalRoot').children.length || S.view === 'stores' || document.activeElement?.id === 'q';
+  if (S.role && document.visibilityState === 'visible' && !busy) act(async () => {});
+}, 60000);
+</script>
+</body>
+</html>
