@@ -213,6 +213,54 @@ async function setAttemptStatus(line, att, v) {
     if (r.error) throw r.error;
     await logEvent(line, 'status', `${short(att.location_name)}: ${STATUS_LABEL[v]}`);
   });
+  // Store has no stock: offer the next closest stores straight away
+  if (v === 'bad' && isAdmin()) openNextStore(line.id, att.location_name);
+}
+
+// "No stock" chooser: next closest stores with stock (stores already asked are left out). Picking one creates the
+// new store request, so the item lands in "Stock check to send" for that store.
+function openNextStore(lineId, fromLoc) {
+  const line = S.lines.find(l => l.id === lineId);
+  if (!line) return;
+  closeModal();
+  const sug = suggestStores(line, 6);
+  const pick = async name => { closeModal(); await assignStore(line, name); S.cat = 'to_check'; render(); };
+  const body = sug.length
+    ? h('div', { class:'pick-list' }, ...sug.map((s, i) => h('button', { class:'store-choice' + (i === 0 ? ' best' : ''), onclick: () => pick(s.loc.name) },
+        h('span', { class:'item-name' }, (i === 0 ? '★ ' : '') + s.loc.short_name),
+        h('span', { class:'muted sm' }, [`${s.qty} in stock`, kmLabel(s), s.covers ? `has ${s.covers} other item${s.covers === 1 ? '' : 's'} on this order` : ''].filter(Boolean).join(' · ')))))
+    : h('div', { class:'banner' }, 'No other store has stock of this item.');
+  const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
+    h('div', { class:'modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Ask another store' },
+      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, `No stock at ${short(fromLoc)}`), h('span', { class:'muted' }, line.order_name),
+        h('button', { class:'btn sm ghost', style:'margin-left:auto', onclick: closeModal }, 'Close')),
+      h('div', { class:'modal-body' },
+        h('div', { class:'item-name' }, line.item_name), h('div', { class:'meta' }, `${line.sku} · qty ${line.qty}`),
+        h('div', { class:'section-title' }, sug.length ? 'Ask another store' : 'What next?'), body),
+      h('div', { class:'modal-foot' },
+        h('button', { class:'btn ghost', onclick: () => { closeModal(); openFoundAtHq(line); } }, 'Found at HQ'),
+        h('button', { class:'btn ghost', onclick: () => { closeModal(); if (confirm(`Mark ${line.order_name} – ${line.item_name} for refund?`)) setLine(line, { state:'refund' }, 'refund', 'Marked for refund'); } }, 'Mark for refund'),
+        h('button', { class:'btn', onclick: closeModal }, 'Not now'))));
+  document.getElementById('modalRoot').append(bg);
+}
+
+// Whole order vs split shipment: does this store's share cover every item still on the Shopify order?
+function shipmentOf(line, loc) {
+  const total = S.orders[line.order_name]?.item_count;
+  if (!loc || total == null) return null;
+  const here = S.lines.filter(l => l.order_name === line.order_name && l.state === 'open').reduce((n, l) => {
+    const a = attemptsFor(l)[0];
+    return a && a.location_name === loc && !['bad','released'].includes(a.status) ? n + l.qty : n;
+  }, 0);
+  const fromStore = Math.max(here, line.qty);
+  return { total, here: fromStore, split: total > fromStore };
+}
+function shipTag(line, loc) {
+  const s = shipmentOf(line, loc);
+  if (!s) return null;
+  return s.split
+    ? h('span', { class:'ship-tag split', title:'The rest of this order ships separately (from the DC or another store)' }, `Split shipment · ${s.here} of ${s.total} item${s.total === 1 ? '' : 's'}`)
+    : h('span', { class:'ship-tag whole', title:'This store sends the whole order' }, 'Whole order from store');
 }
 async function setLine(line, patch, kind, detail) {
   await act(async () => {
@@ -333,9 +381,12 @@ function draftCollection(locName, items) {
   const o = S.orders[items[0].order_name] || {};
   const addr = [o.customer_name + (o.company ? ', ' + o.company : ''), [o.address1, o.address2].filter(Boolean).join(', '), [o.city, o.province, o.zip].filter(Boolean).join(', '), o.phone].filter(Boolean);
   const subject = `Aramex collection today – Online order ${items[0].order_name}${o.customer_name ? ' – ' + o.customer_name : ''}`;
+  const ship = shipmentOf(items[0], locName);
+  const split = ship?.split ? `This is a split shipment: the customer’s other item${ship.total - ship.here === 1 ? ' is' : 's are'} sent separately, so please pack only the item${items.length > 1 ? 's' : ''} above.` : '';
   const html = `<p>Hi ${esc(team)} team,</p><p>Thanks for confirming. Please keep the item${items.length > 1 ? 's' : ''} below aside for <b>Aramex collection today</b>:</p>${itemTable(items)}` +
-    `<p><b>Deliver to:</b><br>${addr.map(esc).join('<br>')}</p><p>Please pack it, mark the parcel with the order number and customer name, and have it ready at the till for the driver.</p><p>Thanks,<br>${esc(CONFIG.SIGN_OFF)}</p>`;
-  const text = `Hi ${team} team,\n\nThanks for confirming. Please keep the item${items.length > 1 ? 's' : ''} below aside for Aramex collection today:\n\n${itemText(items)}\n\nDeliver to:\n${addr.join('\n')}\n\nPlease pack it, mark the parcel with the order number and customer name, and have it ready at the till for the driver.\n\nThanks,\n${CONFIG.SIGN_OFF}`;
+    `<p><b>Deliver to:</b><br>${addr.map(esc).join('<br>')}</p><p>Please pack it, mark the parcel with the order number and customer name, and have it ready at the till for the driver.</p>` +
+    (split ? `<p><b>${esc(split)}</b></p>` : '') + `<p>Thanks,<br>${esc(CONFIG.SIGN_OFF)}</p>`;
+  const text = `Hi ${team} team,\n\nThanks for confirming. Please keep the item${items.length > 1 ? 's' : ''} below aside for Aramex collection today:\n\n${itemText(items)}\n\nDeliver to:\n${addr.join('\n')}\n\nPlease pack it, mark the parcel with the order number and customer name, and have it ready at the till for the driver.\n\n${split ? split + '\n\n' : ''}Thanks,\n${CONFIG.SIGN_OFF}`;
   return { to: S.locByName[locName]?.email || '', subject, html, text };
 }
 
@@ -448,7 +499,8 @@ function openAddShortPick() {
       }
       const card = h('section', { class:'tile' },
         h('header', { class:'tile-head' },
-          h('div', null, h('div', { class:'tile-title mono' }, req.order), h('div', { class:'muted sm' }, [ship.name, [ship.city, ship.province_code].filter(Boolean).join(', ')].filter(Boolean).join(' · ') || 'No delivery address')),
+          h('div', null, h('div', { class:'tile-title mono' }, req.order), h('div', { class:'muted sm' }, [ship.name, [ship.city, ship.province_code].filter(Boolean).join(', '),
+            res.item_count != null ? `${res.item_count} item${res.item_count === 1 ? '' : 's'} on the order` : ''].filter(Boolean).join(' · ') || 'No delivery address')),
           res.fulfillment ? h('span', { class:'badge' }, res.fulfillment.toLowerCase().replace(/_/g, ' ')) : null));
       const orderPicks = [];
       for (const li of usable) {
@@ -628,7 +680,9 @@ function itemTile(x, items) {
   const meta = `${line.order_name} · ${line.sku} · qty ${line.qty}`;
   const where = h('div', { class:'where' },
     loc ? h('span', null, 'Store ', h('b', null, short(loc))) : null,
-    h('span', null, 'Ships to ', h('b', null, [o.city, o.province_code].filter(Boolean).join(', ') || 'unknown')));
+    h('span', null, 'Ships to ', h('b', null, [o.city, o.province_code].filter(Boolean).join(', ') || 'unknown')),
+    !loc && o.item_count > 1 ? h('span', null, 'Order has ', h('b', null, `${o.item_count} items`)) : null);
+  const tag = loc && !['hq_check','need'].includes(x.cat) ? shipTag(line, loc) : null;
   let actions = [];
   if (x.cat === 'hq_check') {
     if (isAdmin()) actions = [h('div', { class:'actions' },
@@ -662,7 +716,7 @@ function itemTile(x, items) {
   }
   actions.push(replyPills(line, st));
   if (isAdmin() && x.cat !== 'done') actions.push(h('button', { class:'btn ghost sm', style:'align-self:flex-start', onclick: () => openFoundAtHq(line) }, 'Found at HQ'));
-  return h('section', { class:'tile' }, itemBlock(line, st, { meta, extra:[where], stock: stockSummary(line, loc), mails: mailLine(st.att) }, ...actions));
+  return h('section', { class:'tile' }, itemBlock(line, st, { meta, extra:[where, tag], stock: stockSummary(line, loc), mails: mailLine(st.att) }, ...actions));
 }
 
 function renderBoard(main) {
@@ -732,10 +786,20 @@ function renderBoard(main) {
       h('span', { class:'cat-s' }, c.sub)))));
 
   const cat = CATEGORIES.find(c => c.key === S.cat);
-  const shown = items.filter(x => x.cat === S.cat)
-    .sort((a, b) => short(a.st.att?.location_name || '').localeCompare(short(b.st.att?.location_name || '')) || a.line.order_name.localeCompare(b.line.order_name));
-  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, cat.title, h('span', { class:'count' }, shown.length)))));
-  if (!shown.length) { main.append(h('div', { class:'empty' }, 'Nothing here right now.')); return; }
+  // Store stages can be split into "whole order from store" and "split shipment"
+  const storeStage = !['hq_check','need'].includes(S.cat);
+  const shipFilter = storeStage ? (S.shipFilter || 'all') : 'all';
+  const inCat = items.filter(x => x.cat === S.cat);
+  const shown = inCat.filter(x => {
+    if (shipFilter === 'all') return true;
+    const s = shipmentOf(x.line, x.st.att?.location_name);
+    return s && (shipFilter === 'split' ? s.split : !s.split);
+  }).sort((a, b) => short(a.st.att?.location_name || '').localeCompare(short(b.st.att?.location_name || '')) || a.line.order_name.localeCompare(b.line.order_name));
+  const splitCount = inCat.filter(x => shipmentOf(x.line, x.st.att?.location_name)?.split).length;
+  const toggle = storeStage ? h('div', { class:'toggle', role:'group', 'aria-label':'Shipment type' }, ...[['all', `All (${inCat.length})`], ['whole', `Whole order (${inCat.length - splitCount})`], ['split', `Split shipment (${splitCount})`]].map(([v, l]) =>
+    h('button', { 'aria-pressed': String(shipFilter === v), onclick: () => { S.shipFilter = v; render(); } }, l))) : null;
+  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, cat.title, h('span', { class:'count' }, shown.length))), toggle));
+  if (!shown.length) { main.append(h('div', { class:'empty' }, inCat.length ? 'Nothing of this shipment type here.' : 'Nothing here right now.')); return; }
   main.append(h('div', { class:'grid even' }, ...shown.map(x => itemTile(x, items))));
 }
 
