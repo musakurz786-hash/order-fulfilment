@@ -1172,7 +1172,7 @@ function renderAdjust(main) {
 function renderStores(main) {
   main.append(h('div', { class:'page-head' }, h('div', null, h('div', { class:'page-title' }, 'Stores'),
     h('div', { class:'page-sub' }, 'Email addresses used on drafts, map positions used to find the closest store, and which locations can be suggested. Map position: copy “latitude, longitude” from Google Maps (right-click the store).'))));
-  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Location','Province','City','Map position','Email','Aramex address','Suggest',''].map(t => h('th', null, t))));
+  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Location','Province','City','Map position','Email', ...(CONFIG.ARAMEX_ENABLED ? ['Aramex address'] : []),'Suggest',''].map(t => h('th', null, t))));
   for (const l of S.locations) {
     const email = h('input', { class:'input', value: l.email || '', style:'width:100%', type:'email', 'aria-label':'Email for ' + l.name });
     const prov = h('select', { class:'input', 'aria-label':'Province for ' + l.name }, ...Object.keys(PROV_NEAR).map(p => h('option', { value:p, selected: l.province_code === p }, p === 'NL' ? 'NL (KZN)' : p)));
@@ -1183,7 +1183,7 @@ function renderStores(main) {
     const addr = h('td', { style:'min-width:200px' }, h('div', { class:'sm' + (addrText ? '' : ' muted') }, addrText || 'Not set'),
       !l.phone && l.street ? h('div', { class:'xs', style:'color:var(--warn)' }, 'No phone – Aramex needs one') : null,
       h('button', { class:'btn sm ghost', style:'margin-top:4px', onclick: () => openStoreAddress(l) }, 'Edit'));
-    tbl.append(h('tr', null, h('td', null, l.name, l.is_hq ? h('span', { class:'badge b-sent', style:'margin-left:6px' }, 'HQ') : null), h('td', null, prov), h('td', null, city), h('td', null, pos), h('td', null, email), addr, h('td', null, sug),
+    tbl.append(h('tr', null, h('td', null, l.name, l.is_hq ? h('span', { class:'badge b-sent', style:'margin-left:6px' }, 'HQ') : null), h('td', null, prov), h('td', null, city), h('td', null, pos), h('td', null, email), CONFIG.ARAMEX_ENABLED ? addr : null, h('td', null, sug),
       h('td', null, h('button', { class:'btn sm', onclick: () => {
         const m = pos.value.trim().match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
         const lat = m ? Number(m[1]) : null, lng = m ? Number(m[2]) : null;
