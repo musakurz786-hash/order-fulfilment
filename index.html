@@ -968,8 +968,8 @@ function itemTile(x, items) {
       tag = h('div', { class:'waiting-for' }, 'Waybill being created…');
     } else {
       const fresh = pairs.filter(p => !p.att.waybill_number);
-      actions.push(h('button', { class:'btn gold sm block', onclick: () => openWaybill(loc, fresh) }, `Create waybill & book collection${fresh.length > 1 ? ` (${fresh.length} items)` : ''}`));
-      actions.push(h('button', { class:'btn outline sm block', onclick: () => openDraft('collect', loc, pairs) }, `Collection email only · ${line.order_name}${n}`));
+      if (CONFIG.ARAMEX_ENABLED) actions.push(h('button', { class:'btn gold sm block', onclick: () => openWaybill(loc, fresh) }, `Create waybill & book collection${fresh.length > 1 ? ` (${fresh.length} items)` : ''}`));
+      actions.push(h('button', { class:'btn ' + (CONFIG.ARAMEX_ENABLED ? 'outline' : 'primary') + ' sm block', onclick: () => openDraft('collect', loc, pairs) }, `Collection email${CONFIG.ARAMEX_ENABLED ? ' only' : ''} · ${line.order_name}${n}`));
     }
   }
   if (x.cat === 'aramex' && isAdmin() && hasWaybill(st.att) && st.att.waybill_pdf) {
@@ -1250,7 +1250,7 @@ async function start(session) {
   try { await loadAll(); } catch (e) { console.error(e); toast('Couldn’t load: ' + e.message); }
   render();
   // Is the Aramex login set up? (no Aramex call is made — the function only checks its own secrets)
-  if (role === 'admin') callAramex({ action:'status' }).then(r => { S.aramexReady = !!r.configured; render(); }).catch(() => { S.aramexReady = false; });
+  if (role === 'admin' && CONFIG.ARAMEX_ENABLED) callAramex({ action:'status' }).then(r => { S.aramexReady = !!r.configured; render(); }).catch(() => { S.aramexReady = false; });
 }
 document.getElementById('loginForm').addEventListener('submit', async e => {
   e.preventDefault();
