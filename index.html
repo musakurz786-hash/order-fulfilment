@@ -255,6 +255,14 @@ function shipmentOf(line, loc) {
   const fromStore = Math.max(here, line.qty);
   return { total, here: fromStore, split: total > fromStore };
 }
+const ageHours = iso => iso ? (Date.now() - new Date(iso)) / 36e5 : 0;
+function ageText(iso) {
+  const hrs = ageHours(iso);
+  if (hrs < 1) return `${Math.max(1, Math.round(hrs * 60))} min`;
+  if (hrs < 24) return `${Math.round(hrs)} h`;
+  const d = Math.floor(hrs / 24);
+  return `${d} day${d === 1 ? '' : 's'}`;
+}
 function shipTag(line, loc) {
   const s = shipmentOf(line, loc);
   if (!s) return null;
@@ -401,8 +409,22 @@ function draftRelease(locName, items, pairs) {
   const text = `Hi ${team} team,\n\n${lead}\n\n${itemText(items)}\n\n${aramex ? aramex + '\n\n' : ''}Thanks for checking,\n${CONFIG.SIGN_OFF}`;
   return { to: S.locByName[locName]?.email || '', subject, html, text };
 }
+// Follow-up to a store that hasn't replied to the stock check yet
+function draftFollowUp(locName, items, pairs) {
+  const team = short(locName);
+  const many = items.length > 1;
+  const first = pairs.map(p => p.att.stock_mail_at).filter(Boolean).sort()[0];
+  const sentOn = first ? new Date(first).toLocaleDateString('en-ZA', { weekday:'long', day:'numeric', month:'long' }) : 'earlier';
+  const subject = 'Follow-up: Stock check – ' + ordersPhrase(items.map(l => l.order_name));
+  const lead = `Just following up on the stock check I sent on ${sentOn} – I haven’t had a reply yet. Please check whether you have the item${many ? 's' : ''} below and set ${many ? 'them' : 'it'} aside:`;
+  const ask = 'Please reply today, even if you don’t have stock, so we can ask another store.';
+  const html = `<p>Hi ${esc(team)} team,</p><p>${esc(lead)}</p>${itemTable(items)}<p>${esc(stockLine(items, locName))}</p><p><b>${esc(ask)}</b></p><p>Thanks,<br>${esc(CONFIG.SIGN_OFF)}</p>`;
+  const text = `Hi ${team} team,\n\n${lead}\n\n${itemText(items)}\n\n${stockLine(items, locName)}\n\n${ask}\n\nThanks,\n${CONFIG.SIGN_OFF}`;
+  return { to: S.locByName[locName]?.email || '', subject, html, text };
+}
 const DRAFT_KINDS = {
   stock:   { title:'Stock check email',  field:'stock_mail_at',   event:'stock_mail',   make: (loc, items) => draftStockCheck(loc, items) },
+  followup:{ title:'Follow-up email',    field:'followup_mail_at', event:'followup_mail', make: (loc, items, pairs) => draftFollowUp(loc, items, pairs) },
   collect: { title:'Collection email',   field:'collect_mail_at', event:'collect_mail', make: (loc, items) => draftCollection(loc, items) },
   release: { title:'No longer needed email', field:'release_mail_at', event:'release_mail', make: (loc, items, pairs) => draftRelease(loc, items, pairs) },
 };
@@ -613,6 +635,7 @@ function mailLine(att) {
     h('span', { class:'mv' }, t ? when(t) : pending));
   return h('ul', { class:'checklist' },
     row('Stock check emailed', att.stock_mail_at, 'Not yet'),
+    att.followup_mail_at ? row('Followed up', att.followup_mail_at, '') : null,
     row('Store replied', att.replied_at, 'Waiting'),
     row('Collection emailed', att.collect_mail_at, 'Not yet'),
     att.collected_at ? row('Collected', att.collected_at, '') : null);
@@ -633,7 +656,7 @@ function itemBlock(line, st, parts, ...actions) {
 }
 const fact = (label, value) => h('div', { class:'fact' }, h('span', { class:'fact-l' }, label), h('span', { class:'fact-v' }, value));
 
-const MAIL_ACTION_LABEL = a => ({ stock_mail:'mark stock check emailed', collect_mail:'mark collection emailed', 'status:ok':'store has stock',
+const MAIL_ACTION_LABEL = a => ({ stock_mail:'mark stock check emailed', followup_mail:'mark follow-up emailed', release_mail:'mark “no longer needed” emailed', collect_mail:'mark collection emailed', 'status:ok':'store has stock',
   'status:bad':'store has no stock', 'status:hold':'put on hold', collected:'mark collected' })[a] || a;
 async function reviewFlag(f, accept) {
   await act(async () => {
@@ -682,7 +705,8 @@ function itemTile(x, items) {
     loc ? h('span', null, 'Store ', h('b', null, short(loc))) : null,
     h('span', null, 'Ships to ', h('b', null, [o.city, o.province_code].filter(Boolean).join(', ') || 'unknown')),
     !loc && o.item_count > 1 ? h('span', null, 'Order has ', h('b', null, `${o.item_count} items`)) : null);
-  const tag = loc && !['hq_check','need'].includes(x.cat) ? shipTag(line, loc) : null;
+  const ship = loc && !['hq_check','need'].includes(x.cat) ? shipTag(line, loc) : null;
+  let tag = null;   // extra line set by the category below (e.g. "No reply for 5 h")
   let actions = [];
   if (x.cat === 'hq_check') {
     if (isAdmin()) actions = [h('div', { class:'actions' },
@@ -709,6 +733,17 @@ function itemTile(x, items) {
     actions.push(h('button', { class:'btn primary sm block', onclick: () => openDraft('stock', loc, batch.map(y => ({ line:y.line, att:y.st.att }))) },
       `Stock check email · ${short(loc)}${batch.length > 1 ? ` (${batch.length} items)` : ''}`));
   }
+  if (x.cat === 'waiting') {
+    // How long the store has been quiet, counted from the last stock check or follow-up
+    const since = st.att.followup_mail_at || st.att.stock_mail_at;
+    tag = h('div', { class:'waiting-for ' + (ageHours(since) >= 4 ? 'late' : '') },
+      `No reply for ${ageText(since)}${st.att.followup_mail_at ? ' since the follow-up' : ''}`);
+    if (isAdmin()) {
+      const batch = items.filter(y => y.cat === 'waiting' && y.st.att.location_name === loc);
+      actions.push(h('button', { class:'btn outline sm block', onclick: () => openDraft('followup', loc, batch.map(y => ({ line:y.line, att:y.st.att }))) },
+        `Follow-up email · ${short(loc)}${batch.length > 1 ? ` (${batch.length} items)` : ''}`));
+    }
+  }
   if (isAdmin() && x.cat === 'to_book') {
     const batch = items.filter(y => y.cat === 'to_book' && y.st.att.location_name === loc && y.line.order_name === line.order_name);
     actions.push(h('button', { class:'btn primary sm block', onclick: () => openDraft('collect', loc, batch.map(y => ({ line:y.line, att:y.st.att }))) },
@@ -716,7 +751,7 @@ function itemTile(x, items) {
   }
   actions.push(replyPills(line, st));
   if (isAdmin() && x.cat !== 'done') actions.push(h('button', { class:'btn ghost sm', style:'align-self:flex-start', onclick: () => openFoundAtHq(line) }, 'Found at HQ'));
-  return h('section', { class:'tile' }, itemBlock(line, st, { meta, extra:[where, tag], stock: stockSummary(line, loc), mails: mailLine(st.att) }, ...actions));
+  return h('section', { class:'tile' }, itemBlock(line, st, { meta, extra:[where, ship, tag], stock: stockSummary(line, loc), mails: mailLine(st.att) }, ...actions));
 }
 
 function renderBoard(main) {
@@ -848,6 +883,7 @@ function renderLookup(main) {
         for (const a of [...atts].reverse()) {
           tl.push([a.created_at, `Asked ${short(a.location_name)}`]);
           if (a.stock_mail_at) tl.push([a.stock_mail_at, `Stock check email sent to ${short(a.location_name)}`]);
+          if (a.followup_mail_at) tl.push([a.followup_mail_at, `Follow-up email sent to ${short(a.location_name)}`]);
           if (a.replied_at) tl.push([a.replied_at, `${short(a.location_name)} replied` + (['ok','bad','hold'].includes(a.status) ? `: ${STATUS_LABEL[a.status]}` : a.status === 'sent' ? ': Has stock' : '')]);
           if (a.release_mail_at) tl.push([a.release_mail_at, `“No longer needed” email sent to ${short(a.location_name)}`]);
           if (a.collect_mail_at) tl.push([a.collect_mail_at, `Collection email sent to ${short(a.location_name)}`]);
