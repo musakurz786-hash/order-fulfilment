@@ -107,9 +107,15 @@ function sayFor(line, st) {
     case 'new': return 'Being sourced. A store has not been asked yet.';
     case 'bad': return `${s} doesn't have it. We're asking another store.`;
     case 'wait': return st.att.stock_mail_at ? `Stock check sent to ${s}. Waiting for the store to reply.` : `${s} will be asked to check stock.`;
-    case 'ok': return st.att.collect_mail_at ? `${s} has it set aside. Aramex collection has been requested.` : `${s} has it set aside. Collection still to be booked.`;
+    case 'ok': return st.att.collect_mail_at || st.att.collection_ref
+      ? `${s} has it set aside. Aramex collection has been requested${hasWaybill(st.att) ? ` (waybill ${st.att.waybill_number})` : ''}.`
+      : `${s} has it set aside. Collection still to be booked.`;
     case 'hold': return `On hold at ${s}. Waiting on a decision from the DC.`;
-    default: return `Collected by Aramex from ${s}.`;
+    default: {
+      const a = st.att;
+      if (a?.delivered_at) return `Delivered to the customer by Aramex on ${when(a.delivered_at)} (waybill ${a.waybill_number}).`;
+      return `Collected by Aramex from ${s}.` + (hasWaybill(a) ? ` Waybill ${a.waybill_number}${a.aramex_status ? ` – latest: ${a.aramex_status}` : ''}.` : '');
+    }
   }
 }
 const isOpenStage = k => !['sent','hq','refund','cancelled'].includes(k);
@@ -355,6 +361,194 @@ async function callSync(body) {
   return data;
 }
 
+// ---------- Aramex (ACI) ----------
+// Waybills are billable: only ever made from an explicit click + confirm, one order from one store per waybill.
+// The function saves the waybill PDF (Aramex's own link expires in 30 minutes) for attaching to the store's email.
+async function callAramex(body) {
+  const { data, error } = await supa.functions.invoke(CONFIG.ARAMEX_FUNCTION, { body });
+  if (error) {
+    let msg = error.message;
+    try { const j = await error.context.json(); msg = j.error || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  return data;
+}
+const hasWaybill = a => !!(a && a.waybill_number && a.waybill_number !== 'PENDING');
+const PARCELS = [
+  { key:'flyer', label:'Flyer bag', weight:1, length:40, width:30, height:5 },
+  { key:'shoe',  label:'Shoe box',  weight:2, length:36, width:24, height:14 },
+  { key:'box',   label:'Medium box', weight:4, length:45, width:35, height:25 },
+  { key:'custom', label:'Custom size' },
+];
+const SERVICE_LABEL = { PEC:'Economy (PEC)', ONP:'Overnight (ONP)', PEX:'Road express (PEX)' };
+// Next working day (Mon–Sat) after 13:00, otherwise today
+function defaultPickup() {
+  const d = new Date();
+  if (d.getHours() >= 13) d.setDate(d.getDate() + 1);
+  if (d.getDay() === 0) d.setDate(d.getDate() + 1);
+  return d.toLocaleDateString('en-CA');
+}
+async function downloadWaybill(att, orderName) {
+  if (!att.waybill_pdf) { toast('No PDF saved for this waybill'); return; }
+  const { data, error } = await supa.storage.from('waybills').download(att.waybill_pdf);
+  if (error) { toast('Couldn’t get the PDF: ' + error.message); return; }
+  const a = h('a', { href: URL.createObjectURL(data), download: `Aramex waybill ${att.waybill_number} – ${orderName}.pdf` });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+async function trackNow(ids) {
+  try {
+    const r = await callAramex(ids ? { action:'track', attempt_ids: ids } : { action:'track' });
+    await loadAll(); render();
+    toast(r.tracked ? `Checked ${r.tracked} waybill${r.tracked === 1 ? '' : 's'} with Aramex${r.updated ? ` – ${r.updated} update${r.updated === 1 ? '' : 's'}` : ''}` : 'No waybills to track');
+  } catch (e) { toast('Tracking failed: ' + e.message); }
+}
+
+// mode 'create': waybill (+ collection); mode 'collect': book the collection for an existing waybill
+function openWaybill(locName, pairs, mode = 'create') {
+  closeModal();
+  const items = pairs.map(p => p.line);
+  const order = items[0].order_name;
+  const o = S.orders[order] || {};
+  const L = S.locByName[locName] || {};
+  const inp = (val, attrs = {}) => h('input', { class:'input', value: val ?? '', ...attrs });
+  const fld = (label, el, cls) => h('label', { class:'wb-f' + (cls ? ' ' + cls : '') }, label, el);
+
+  // Sender = the store (Aramex validates suburb + postal code)
+  const sn = { name: inp(L.name || locName), street: inp(L.street), complex: inp(L.complex), suburb: inp(L.suburb), postal_code: inp(L.postal_code, { inputmode:'numeric' }),
+    state: inp(L.city), phone: inp(L.phone, { type:'tel' }) };
+  const saveStore = h('input', { type:'checkbox', checked: true });
+  // Receiver = the customer (Shopify's 2nd address line is usually the suburb)
+  const rc = { name: inp([o.customer_name, o.company].filter(Boolean).join(' – ')), street: inp(o.address1), complex: inp(''), suburb: inp(o.address2 || o.city),
+    postal_code: inp(o.zip, { inputmode:'numeric' }), state: inp(o.city), phone: inp(o.phone, { type:'tel' }) };
+  const val = f => Object.fromEntries(Object.entries(f).map(([k, e]) => [k, e.value.trim()]));
+
+  // Aramex suburb check: pick the exact suburb / postal code Aramex knows
+  function postalBox(f) {
+    const out = h('div', { class:'wb-postal' });
+    const btn = h('button', { class:'btn sm outline', type:'button', onclick: async () => {
+      btn.disabled = true; out.replaceChildren(h('span', { class:'muted sm' }, 'Asking Aramex…'));
+      try {
+        const r = await callAramex({ action:'postal', postal_code: f.postal_code.value.trim(), suburb: f.suburb.value.trim() });
+        if (!r.results.length) out.replaceChildren(h('span', { class:'banner' }, `Aramex: ${r.message || 'no match'}. Try only the postal code.`));
+        else {
+          const sel = h('select', { class:'input', 'aria-label':'Aramex suburb' }, h('option', { value:'' }, `${r.results.length} match${r.results.length === 1 ? '' : 'es'} – choose one`),
+            ...r.results.map((p, i) => h('option', { value: i }, `${p.suburb}, ${p.city} ${p.postal_code}`)));
+          sel.addEventListener('change', () => { const p = r.results[sel.value]; if (p) { f.suburb.value = p.suburb; f.postal_code.value = p.postal_code; if (p.city) f.state.value = p.city; } });
+          out.replaceChildren(sel);
+        }
+      } catch (e) { out.replaceChildren(h('span', { class:'banner err' }, e.message)); }
+      btn.disabled = false;
+    } }, 'Check suburb with Aramex');
+    return [btn, out];
+  }
+  const partyBox = (title, f, extra) => h('div', { class:'wb-box' },
+    h('div', { class:'section-title' }, title),
+    h('div', { class:'wb-grid' },
+      fld('Name', f.name, 'span2'), fld('Street address', f.street, 'span2'), fld('Complex / mall', f.complex, 'span2'),
+      fld('Suburb', f.suburb), fld('Postal code', f.postal_code), fld('Town', f.state), fld('Phone', f.phone)),
+    ...postalBox(f), extra || null);
+
+  // Parcel: picked per waybill
+  const preset = h('select', { class:'input', 'aria-label':'Parcel size' }, h('option', { value:'' }, 'Choose a size…'), ...PARCELS.map(p => h('option', { value:p.key }, p.label + (p.length ? ` – ${p.length}×${p.width}×${p.height} cm` : ''))));
+  const pf = { weight: inp('', { type:'number', min:'0.1', step:'0.1' }), length: inp('', { type:'number', min:'1' }), width: inp('', { type:'number', min:'1' }), height: inp('', { type:'number', min:'1' }),
+    quantity: inp('1', { type:'number', min:'1', max:'20' }) };
+  preset.addEventListener('change', () => { const p = PARCELS.find(x => x.key === preset.value); if (p && p.length) for (const k of ['weight','length','width','height']) pf[k].value = p[k]; check(); });
+  const service = h('select', { class:'input', 'aria-label':'Service' }, ...Object.entries(SERVICE_LABEL).map(([k, l]) => h('option', { value:k }, l)));
+  const att0 = pairs[0].att;
+  if (mode === 'collect' && att0.waybill_service) service.value = att0.waybill_service;
+
+  // Collection
+  const book = h('input', { type:'checkbox', checked: true });
+  const date = inp(defaultPickup(), { type:'date' });
+  const ready = inp('12:00', { type:'time' }), closing = inp('17:00', { type:'time' });
+  const instr = inp(`Online order ${order} - collect from ${short(locName)}`, { maxlength: 100 });
+
+  const msg = h('div', { role:'alert' });
+  const go = h('button', { class:'btn gold', disabled: true }, mode === 'collect' ? 'Book collection' : 'Create waybill (billable)');
+  function check() {
+    const p = mode === 'collect' || ['weight','length','width','height'].every(k => Number(pf[k].value) > 0);
+    go.disabled = !(S.aramexReady && p);
+  }
+  Object.values(pf).forEach(e => e.addEventListener('input', check));
+
+  go.addEventListener('click', async () => {
+    const s = val(sn), r = val(rc);
+    const gaps = ['street','suburb','postal_code','phone'].filter(k => !s[k]).map(k => 'store ' + k.replace('_', ' '))
+      .concat(['name','street','suburb','postal_code','phone'].filter(k => !r[k]).map(k => 'customer ' + k.replace('_', ' ')));
+    if (gaps.length) { msg.replaceChildren(h('div', { class:'banner err' }, 'Fill in: ' + gaps.join(', ') + '.')); return; }
+    const parcel = { description:'Clothing', ...Object.fromEntries(Object.entries(pf).map(([k, e]) => [k, Number(e.value)])) };
+    const q = mode === 'collect'
+      ? `Book an Aramex collection for waybill ${att0.waybill_number} from ${short(locName)} on ${date.value}?`
+      : `Create an Aramex waybill for ${order} from ${short(locName)}?\n\n${SERVICE_LABEL[service.value]}, ${parcel.quantity} × ${parcel.length}×${parcel.width}×${parcel.height} cm, ${parcel.weight} kg.\n\nThis is billed to the FOM Aramex account.${book.checked ? `\nCollection: ${date.value} ${ready.value}–${closing.value}.` : ''}`;
+    if (!confirm(q)) return;
+    go.disabled = true; go.textContent = 'Talking to Aramex…';
+    msg.replaceChildren();
+    try {
+      if (saveStore.checked) {
+        const u = await supa.from('ful_locations').update({ street: s.street || null, complex: s.complex || null, suburb: s.suburb || null, postal_code: s.postal_code || null, phone: s.phone || null }).eq('name', locName);
+        if (u.error) throw u.error;
+      }
+      const body = { attempt_ids: pairs.map(p => p.att.id), sender: s, receiver: r, pickup_date: date.value, ready_time: ready.value + ':00', closing_time: closing.value + ':00' };
+      const res = mode === 'collect'
+        ? await callAramex({ action:'collect', ...body })
+        : await callAramex({ action:'create', ...body, service: service.value, parcels: [parcel], special_instructions: instr.value.trim(), book_collection: book.checked });
+      await loadAll(); render();
+      const fresh = pairs.map(p => ({ line: p.line, att: S.attempts.find(a => a.id === p.att.id) || p.att }));
+      openWaybillDone(locName, fresh, res);
+    } catch (e) {
+      msg.replaceChildren(h('div', { class:'banner err' }, e.message));
+      go.disabled = false; go.textContent = mode === 'collect' ? 'Book collection' : 'Create waybill (billable)';
+    }
+  });
+
+  const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
+    h('div', { class:'modal wide-modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Aramex waybill' },
+      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, mode === 'collect' ? 'Book Aramex collection' : 'Aramex waybill & collection'),
+        h('span', { class:'muted' }, `${order} · ${short(locName)}`),
+        h('button', { class:'btn sm ghost', style:'margin-left:auto', onclick: closeModal }, 'Close')),
+      h('div', { class:'modal-body' },
+        S.aramexReady ? null : h('div', { class:'banner err' }, 'The Aramex login isn’t set up yet, so nothing can be booked. It goes into the Supabase secrets of the ful-aramex function.'),
+        h('div', { class:'meta' }, items.map(l => `${l.item_name} · ${l.sku} · qty ${l.qty}`).join(' | ')),
+        mode === 'collect' ? h('div', { class:'muted sm' }, `Waybill ${att0.waybill_number}`) : null,
+        h('div', { class:'wb-cols' },
+          partyBox('Collect from (store)', sn, h('label', { class:'muted sm', style:'display:flex;gap:8px;align-items:center' }, saveStore, 'Save as this store’s address')),
+          partyBox('Deliver to (customer)', rc)),
+        mode === 'collect' ? null : h('div', { class:'wb-box' },
+          h('div', { class:'section-title' }, 'Parcel'),
+          h('div', { class:'wb-row' }, fld('Size', preset), fld('Service', service)),
+          h('div', { class:'wb-row' }, fld('Weight (kg)', pf.weight), fld('Length (cm)', pf.length), fld('Width (cm)', pf.width), fld('Height (cm)', pf.height), fld('Parcels', pf.quantity)),
+          fld('Special instructions', instr)),
+        h('div', { class:'wb-box' },
+          h('div', { class:'section-title' }, 'Collection'),
+          mode === 'collect' ? null : h('label', { class:'muted sm', style:'display:flex;gap:8px;align-items:center' }, book, 'Book the Aramex collection from the store too'),
+          h('div', { class:'wb-row' }, fld('Date', date), fld('Ready from', ready), fld('Store closes', closing))),
+        msg),
+      h('div', { class:'modal-foot' }, h('button', { class:'btn ghost', onclick: closeModal }, 'Cancel'), go)));
+  document.getElementById('modalRoot').append(bg);
+  check();
+}
+
+function openWaybillDone(locName, pairs, res) {
+  closeModal();
+  const att = pairs[0].att, order = pairs[0].line.order_name;
+  const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
+    h('div', { class:'modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Waybill created' },
+      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, res.waybill_number ? 'Waybill created' : 'Collection booked'), h('span', { class:'muted' }, `${order} · ${short(locName)}`),
+        h('button', { class:'btn sm ghost', style:'margin-left:auto', onclick: closeModal }, 'Close')),
+      h('div', { class:'modal-body' },
+        h('div', { class:'wb-done' }, h('span', { class:'muted sm' }, 'Aramex waybill'), h('span', { class:'wb-num' }, att.waybill_number)),
+        res.change_description ? h('div', { class:'banner' }, 'Aramex adjusted the address: ' + res.change_description) : null,
+        res.pdf_error ? h('div', { class:'banner err' }, `The waybill PDF couldn’t be saved (${res.pdf_error}). Download it from ACI instead.`) : null,
+        att.collection_ref ? h('div', { class:'banner ok' }, `Collection booked for ${att.collection_date} – reference ${att.collection_ref}.`) : null,
+        res.collection_error ? h('div', { class:'banner err' }, `The waybill was made, but the collection wasn’t booked: ${res.collection_error}. Use “Book collection” on the tile to try again, or book it in ACI.`) : null,
+        h('div', { class:'muted sm' }, 'Next: download the PDF, then open the collection email, paste it into Outlook and attach the PDF.')),
+      h('div', { class:'modal-foot' },
+        att.waybill_pdf ? h('button', { class:'btn', onclick: () => downloadWaybill(att, order) }, 'Download waybill PDF') : null,
+        h('button', { class:'btn primary', onclick: () => openDraft('collect', locName, pairs) }, 'Collection email'))));
+  document.getElementById('modalRoot').append(bg);
+}
+
 // ---------- email drafts ----------
 function stockLine(items, loc) {
   const qs = items.map(l => avail(l.sku, loc));
@@ -384,17 +578,23 @@ function draftStockCheck(locName, items) {
   const text = `Hi ${team} team,\n\n${ask}\n\n${itemText(items)}\n\n${stockLine(items, locName)} Please reply today to confirm.\n\n` + notes.map(n => n + '\n\n').join('') + `Thanks,\n${CONFIG.SIGN_OFF}`;
   return { to: S.locByName[locName]?.email || '', subject, html, text };
 }
-function draftCollection(locName, items) {
+function draftCollection(locName, items, pairs = []) {
   const team = short(locName);
   const o = S.orders[items[0].order_name] || {};
   const addr = [o.customer_name + (o.company ? ', ' + o.company : ''), [o.address1, o.address2].filter(Boolean).join(', '), [o.city, o.province, o.zip].filter(Boolean).join(', '), o.phone].filter(Boolean);
   const subject = `Aramex collection today – Online order ${items[0].order_name}${o.customer_name ? ' – ' + o.customer_name : ''}`;
   const ship = shipmentOf(items[0], locName);
   const split = ship?.split ? `This is a split shipment: the customer’s other item${ship.total - ship.here === 1 ? ' is' : 's are'} sent separately, so please pack only the item${items.length > 1 ? 's' : ''} above.` : '';
+  // Waybill made in the app: the store prints the attached PDF and sticks it on the parcel
+  const wb = pairs.map(p => p.att).find(hasWaybill);
+  const wbLine = wb ? `Aramex waybill: ${wb.waybill_number} (attached). Please print it and stick it on the parcel.` : '';
+  const colLine = wb?.collection_ref ? `Aramex is booked to collect${wb.collection_date ? ' on ' + new Date(wb.collection_date + 'T12:00').toLocaleDateString('en-ZA', { weekday:'long', day:'numeric', month:'long' }) : ''} (collection ref ${wb.collection_ref}).` : '';
   const html = `<p>Hi ${esc(team)} team,</p><p>Thanks for confirming. Please keep the item${items.length > 1 ? 's' : ''} below aside for <b>Aramex collection today</b>:</p>${itemTable(items)}` +
-    `<p><b>Deliver to:</b><br>${addr.map(esc).join('<br>')}</p><p>Please pack it, mark the parcel with the order number and customer name, and have it ready at the till for the driver.</p>` +
+    `<p><b>Deliver to:</b><br>${addr.map(esc).join('<br>')}</p>` +
+    (wb ? `<p><b>${esc(wbLine)}</b>${colLine ? '<br>' + esc(colLine) : ''}</p><p>Please pack it, mark the parcel with the order number and customer name, and have it ready at the till for the driver.</p>`
+        : `<p>Please pack it, mark the parcel with the order number and customer name, and have it ready at the till for the driver.</p>`) +
     (split ? `<p><b>${esc(split)}</b></p>` : '') + `<p>Thanks,<br>${esc(CONFIG.SIGN_OFF)}</p>`;
-  const text = `Hi ${team} team,\n\nThanks for confirming. Please keep the item${items.length > 1 ? 's' : ''} below aside for Aramex collection today:\n\n${itemText(items)}\n\nDeliver to:\n${addr.join('\n')}\n\nPlease pack it, mark the parcel with the order number and customer name, and have it ready at the till for the driver.\n\n${split ? split + '\n\n' : ''}Thanks,\n${CONFIG.SIGN_OFF}`;
+  const text = `Hi ${team} team,\n\nThanks for confirming. Please keep the item${items.length > 1 ? 's' : ''} below aside for Aramex collection today:\n\n${itemText(items)}\n\nDeliver to:\n${addr.join('\n')}\n\n${wb ? wbLine + (colLine ? '\n' + colLine : '') + '\n\n' : ''}Please pack it, mark the parcel with the order number and customer name, and have it ready at the till for the driver.\n\n${split ? split + '\n\n' : ''}Thanks,\n${CONFIG.SIGN_OFF}`;
   return { to: S.locByName[locName]?.email || '', subject, html, text };
 }
 
@@ -425,7 +625,7 @@ function draftFollowUp(locName, items, pairs) {
 const DRAFT_KINDS = {
   stock:   { title:'Stock check email',  field:'stock_mail_at',   event:'stock_mail',   make: (loc, items) => draftStockCheck(loc, items) },
   followup:{ title:'Follow-up email',    field:'followup_mail_at', event:'followup_mail', make: (loc, items, pairs) => draftFollowUp(loc, items, pairs) },
-  collect: { title:'Collection email',   field:'collect_mail_at', event:'collect_mail', make: (loc, items) => draftCollection(loc, items) },
+  collect: { title:'Collection email',   field:'collect_mail_at', event:'collect_mail', make: (loc, items, pairs) => draftCollection(loc, items, pairs) },
   release: { title:'No longer needed email', field:'release_mail_at', event:'release_mail', make: (loc, items, pairs) => draftRelease(loc, items, pairs) },
 };
 
@@ -451,6 +651,8 @@ function openDraft(kind, locName, pairs) {
         d.to ? null : h('div', { class:'banner' }, `No email address saved for ${short(locName)} yet. Add it on the Stores tab.`),
         field('To', d.to), field('Subject', d.subject), preview),
       h('div', { class:'modal-foot' },
+        (() => { const wb = kind === 'collect' && pairs.map(p => p.att).find(a => hasWaybill(a) && a.waybill_pdf);
+          return wb ? h('button', { class:'btn outline', onclick: () => downloadWaybill(wb, items[0].order_name) }, 'Download waybill PDF') : null; })(),
         h('button', { class:'btn', onclick: () => copyRich(d.html, d.text).then(() => toast('Email body copied. Paste it into Outlook.')) }, 'Copy email body'),
         h('button', { class:'btn gold', onclick: async () => {
           closeModal();
@@ -637,8 +839,16 @@ function mailLine(att) {
     row('Stock check emailed', att.stock_mail_at, 'Not yet'),
     att.followup_mail_at ? row('Followed up', att.followup_mail_at, '') : null,
     row('Store replied', att.replied_at, 'Waiting'),
+    hasWaybill(att) ? row('Waybill ' + att.waybill_number, att.waybill_created_at, '') : null,
     row('Collection emailed', att.collect_mail_at, 'Not yet'),
-    att.collected_at ? row('Collected', att.collected_at, '') : null);
+    att.collected_at ? row('Collected', att.collected_at, '') : null,
+    att.delivered_at ? row('Delivered', att.delivered_at, '') : null);
+}
+// Latest Aramex tracking update for a waybill made in the app
+function courierTag(att) {
+  if (!hasWaybill(att)) return null;
+  const text = att.delivered_at ? `Delivered ${when(att.delivered_at)}` : `Aramex: ${att.aramex_status || 'waybill created'}${att.aramex_status_at ? ' · ' + when(att.aramex_status_at) : ''}`;
+  return h('span', { class:'courier' + (att.delivered_at ? ' delivered' : ''), title:'Waybill ' + att.waybill_number }, text);
 }
 const STAGE_RANK = { bad:0, new:1, hq_check:2, wait:3, hold:4, ok:5, sent:6, hq:7, refund:8, cancelled:9 };
 // Item layout used in every tile: name + status on top, then details; actions pinned to the bottom edge so
@@ -746,12 +956,28 @@ function itemTile(x, items) {
   }
   if (isAdmin() && x.cat === 'to_book') {
     const batch = items.filter(y => y.cat === 'to_book' && y.st.att.location_name === loc && y.line.order_name === line.order_name);
-    actions.push(h('button', { class:'btn primary sm block', onclick: () => openDraft('collect', loc, batch.map(y => ({ line:y.line, att:y.st.att }))) },
-      `Collection email · ${line.order_name}${batch.length > 1 ? ` (${batch.length} items)` : ''}`));
+    const pairs = batch.map(y => ({ line:y.line, att:y.st.att }));
+    const n = batch.length > 1 ? ` (${batch.length} items)` : '';
+    if (hasWaybill(st.att)) {
+      // Waybill made: same waybill for every item of this order at this store
+      const same = pairs.filter(p => p.att.waybill_number === st.att.waybill_number);
+      if (st.att.waybill_pdf) actions.push(h('button', { class:'btn outline sm block', onclick: () => downloadWaybill(st.att, line.order_name) }, 'Download waybill PDF'));
+      if (!st.att.collection_ref) actions.push(h('button', { class:'btn outline sm block', onclick: () => openWaybill(loc, same, 'collect') }, 'Book collection'));
+      actions.push(h('button', { class:'btn primary sm block', onclick: () => openDraft('collect', loc, same) }, `Collection email · ${line.order_name}${n}`));
+    } else if (st.att.waybill_number === 'PENDING') {
+      tag = h('div', { class:'waiting-for' }, 'Waybill being created…');
+    } else {
+      const fresh = pairs.filter(p => !p.att.waybill_number);
+      actions.push(h('button', { class:'btn gold sm block', onclick: () => openWaybill(loc, fresh) }, `Create waybill & book collection${fresh.length > 1 ? ` (${fresh.length} items)` : ''}`));
+      actions.push(h('button', { class:'btn outline sm block', onclick: () => openDraft('collect', loc, pairs) }, `Collection email only · ${line.order_name}${n}`));
+    }
+  }
+  if (x.cat === 'aramex' && isAdmin() && hasWaybill(st.att) && st.att.waybill_pdf) {
+    actions.push(h('button', { class:'btn outline sm block', onclick: () => downloadWaybill(st.att, line.order_name) }, 'Download waybill PDF'));
   }
   actions.push(replyPills(line, st));
   if (isAdmin() && x.cat !== 'done') actions.push(h('button', { class:'btn ghost sm', style:'align-self:flex-start', onclick: () => openFoundAtHq(line) }, 'Found at HQ'));
-  return h('section', { class:'tile' }, itemBlock(line, st, { meta, extra:[where, ship, tag], stock: stockSummary(line, loc), mails: mailLine(st.att) }, ...actions));
+  return h('section', { class:'tile' }, itemBlock(line, st, { meta, extra:[where, ship, courierTag(st.att), tag], stock: stockSummary(line, loc), mails: mailLine(st.att) }, ...actions));
 }
 
 function renderBoard(main) {
@@ -773,6 +999,7 @@ function renderBoard(main) {
         catch (err) { S.syncMsg = { ok:false, text:'Shopify sync failed: ' + err.message }; }
         render();
       } }, 'Sync Shopify') : null,
+      isAdmin() && S.aramexReady && S.attempts.some(a => hasWaybill(a) && !a.delivered_at) ? h('button', { class:'btn', onclick: async e => { e.target.disabled = true; await trackNow(); } }, 'Check Aramex tracking') : null,
       h('button', { class:'btn', onclick: () => act(async () => {}, 'Refreshed') }, 'Refresh'),
       isAdmin() ? h('button', { class:'btn primary', onclick: openAddShortPick }, '+ Add short pick') : null)));
   if (S.syncMsg) main.append(h('div', { class:'banner ' + (S.syncMsg.ok ? 'ok' : 'err') }, S.syncMsg.text));
@@ -886,8 +1113,10 @@ function renderLookup(main) {
           if (a.followup_mail_at) tl.push([a.followup_mail_at, `Follow-up email sent to ${short(a.location_name)}`]);
           if (a.replied_at) tl.push([a.replied_at, `${short(a.location_name)} replied` + (['ok','bad','hold'].includes(a.status) ? `: ${STATUS_LABEL[a.status]}` : a.status === 'sent' ? ': Has stock' : '')]);
           if (a.release_mail_at) tl.push([a.release_mail_at, `“No longer needed” email sent to ${short(a.location_name)}`]);
+          if (hasWaybill(a)) tl.push([a.waybill_created_at, `Aramex waybill ${a.waybill_number} created${a.collection_ref ? ` – collection booked for ${a.collection_date} (ref ${a.collection_ref})` : ''}`]);
           if (a.collect_mail_at) tl.push([a.collect_mail_at, `Collection email sent to ${short(a.location_name)}`]);
           if (a.collected_at) tl.push([a.collected_at, `Collected from ${short(a.location_name)}`]);
+          for (const t of a.aramex_events || []) if (t.at && !isNaN(new Date(t.at))) tl.push([new Date(t.at).toISOString(), `Aramex: ${t.text}${t.location ? ' (' + t.location + ')' : ''}`]);
         }
         for (const e of evs) if (['hq_found','hq_not_found','refund','email'].includes(e.kind)) tl.push([e.at,
           e.kind === 'hq_found' ? 'Found at HQ' : e.kind === 'refund' ? 'Marked for refund' : e.kind === 'email' ? (e.detail || 'Updated from email') : 'Not found at HQ (' + (e.detail || '') + ')']);
@@ -895,7 +1124,7 @@ function renderLookup(main) {
         card.append(h('div', { class:'sub' },
           itemBlock(line, st, {
             meta: `${line.sku} · qty ${line.qty}${st.att ? ' · sourcing from ' + short(st.att.location_name) : ''}`,
-            extra: [h('div', { class:'say' }, sayFor(line, st))],
+            extra: [h('div', { class:'say' }, sayFor(line, st)), courierTag(st.att)],
             stock: stockSummary(line, st.att?.location_name), mails: mailLine(st.att),
           },
             h('details', { class:'history' }, h('summary', null, 'History'),
@@ -943,14 +1172,18 @@ function renderAdjust(main) {
 function renderStores(main) {
   main.append(h('div', { class:'page-head' }, h('div', null, h('div', { class:'page-title' }, 'Stores'),
     h('div', { class:'page-sub' }, 'Email addresses used on drafts, map positions used to find the closest store, and which locations can be suggested. Map position: copy “latitude, longitude” from Google Maps (right-click the store).'))));
-  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Location','Province','City','Map position','Email','Suggest',''].map(t => h('th', null, t))));
+  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Location','Province','City','Map position','Email','Aramex address','Suggest',''].map(t => h('th', null, t))));
   for (const l of S.locations) {
     const email = h('input', { class:'input', value: l.email || '', style:'width:100%', type:'email', 'aria-label':'Email for ' + l.name });
     const prov = h('select', { class:'input', 'aria-label':'Province for ' + l.name }, ...Object.keys(PROV_NEAR).map(p => h('option', { value:p, selected: l.province_code === p }, p === 'NL' ? 'NL (KZN)' : p)));
     const city = h('input', { class:'input', value: l.city || '', style:'width:100%', 'aria-label':'City for ' + l.name });
     const pos = h('input', { class:'input mono', value: l.lat != null ? `${l.lat}, ${l.lng}` : '', placeholder:'-33.89, 18.51', style:'width:100%;min-width:130px', 'aria-label':'Map position for ' + l.name });
     const sug = h('input', { type:'checkbox', checked: l.sourceable, 'aria-label':'Suggest ' + l.name });
-    tbl.append(h('tr', null, h('td', null, l.name, l.is_hq ? h('span', { class:'badge b-sent', style:'margin-left:6px' }, 'HQ') : null), h('td', null, prov), h('td', null, city), h('td', null, pos), h('td', null, email), h('td', null, sug),
+    const addrText = [l.street, l.complex, [l.suburb, l.postal_code].filter(Boolean).join(' '), l.phone].filter(Boolean).join(', ');
+    const addr = h('td', { style:'min-width:200px' }, h('div', { class:'sm' + (addrText ? '' : ' muted') }, addrText || 'Not set'),
+      !l.phone && l.street ? h('div', { class:'xs', style:'color:var(--warn)' }, 'No phone – Aramex needs one') : null,
+      h('button', { class:'btn sm ghost', style:'margin-top:4px', onclick: () => openStoreAddress(l) }, 'Edit'));
+    tbl.append(h('tr', null, h('td', null, l.name, l.is_hq ? h('span', { class:'badge b-sent', style:'margin-left:6px' }, 'HQ') : null), h('td', null, prov), h('td', null, city), h('td', null, pos), h('td', null, email), addr, h('td', null, sug),
       h('td', null, h('button', { class:'btn sm', onclick: () => {
         const m = pos.value.trim().match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
         const lat = m ? Number(m[1]) : null, lng = m ? Number(m[2]) : null;
@@ -962,6 +1195,27 @@ function renderStores(main) {
       } }, 'Save'))));
   }
   main.append(h('div', { class:'card', style:'overflow-x:auto' }, tbl));
+}
+
+// Store address used as the Aramex collection (sender) address
+function openStoreAddress(l) {
+  closeModal();
+  const f = Object.fromEntries(['street','complex','suburb','postal_code','phone'].map(k => [k, h('input', { class:'input', value: l[k] || '' })]));
+  const lab = { street:'Street address', complex:'Complex / mall', suburb:'Suburb', postal_code:'Postal code', phone:'Phone' };
+  const save = h('button', { class:'btn primary' }, 'Save');
+  save.addEventListener('click', () => { closeModal(); act(async () => {
+    const patch = Object.fromEntries(Object.entries(f).map(([k, e]) => [k, e.value.trim() || null]));
+    const r = await supa.from('ful_locations').update(patch).eq('name', l.name); if (r.error) throw r.error;
+  }, 'Saved ' + l.short_name); });
+  const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
+    h('div', { class:'modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Store address' },
+      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, 'Aramex collection address'), h('span', { class:'muted' }, l.name),
+        h('button', { class:'btn sm ghost', style:'margin-left:auto', onclick: closeModal }, 'Close')),
+      h('div', { class:'modal-body' },
+        h('div', { class:'muted sm' }, 'Use the same address as the store’s profile in ACI. Aramex checks the suburb and postal code together.'),
+        h('div', { class:'wb-grid' }, ...Object.entries(f).map(([k, e]) => h('label', { class:'wb-f' + (['street','complex'].includes(k) ? ' span2' : '') }, lab[k], e)))),
+      h('div', { class:'modal-foot' }, h('button', { class:'btn ghost', onclick: closeModal }, 'Cancel'), save)));
+  document.getElementById('modalRoot').append(bg);
 }
 
 function render() {
@@ -995,6 +1249,8 @@ async function start(session) {
   document.getElementById('loginView').hidden = true; document.getElementById('appView').hidden = false;
   try { await loadAll(); } catch (e) { console.error(e); toast('Couldn’t load: ' + e.message); }
   render();
+  // Is the Aramex login set up? (no Aramex call is made — the function only checks its own secrets)
+  if (role === 'admin') callAramex({ action:'status' }).then(r => { S.aramexReady = !!r.configured; render(); }).catch(() => { S.aramexReady = false; });
 }
 document.getElementById('loginForm').addEventListener('submit', async e => {
   e.preventDefault();
