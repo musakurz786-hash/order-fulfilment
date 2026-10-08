@@ -24,7 +24,7 @@
   <header class="top">
     <div class="brand">Order Fulfilment</div>
     <nav class="tabs" role="tablist" id="tabs"></nav>
-    <div class="who"><span id="whoEmail"></span><span class="role" id="whoRole"></span><button class="btn sm ghost" id="signOut">Sign out</button></div>
+    <div class="who"><span id="whoEmail"></span><span class="role" id="whoRole"></span><button class="btn sm ghost" id="changePw">Change password</button><button class="btn sm ghost" id="signOut">Sign out</button></div>
   </header>
   <main id="main"></main>
 </div>
@@ -115,21 +115,40 @@ function sayFor(line, st) {
 const isOpenStage = k => !['sent','hq','refund','cancelled'].includes(k);
 
 // ---------- store suggestion ----------
-function suggestStores(line, limit = 4) {
-  const order = S.orders[line.order_name] || {};
-  const tried = new Set(attemptsFor(line).map(a => a.location_name));
+// Closest stores with stock for one item, by real straight-line distance to the customer when both positions are
+// known; otherwise same town, then same province, then neighbouring provinces. A store that can also supply the
+// order's other items wins if it's within ~30 km of the closest (so the order ships as one parcel).
+// stockOf(sku, location) lets the Add-short-pick preview rank stores before anything is saved.
+const NUDGE_KM = 30;
+function km(a, b) {
+  const R = 6371, rad = d => d * Math.PI / 180;
+  const dLat = rad(b.lat - a.lat), dLng = rad(b.lng - a.lng);
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+function rankStores({ sku, qty, order, siblings = [], exclude = new Set(), stockOf = avail, limit = 4 }) {
   const near = PROV_NEAR[order.province_code] || PROV_NEAR.WC;
   const city = String(order.city || '').toLowerCase().trim();
+  const hasPos = order.lat != null && order.lng != null;
+  return S.locations.filter(l => l.sourceable && !l.is_hq && !exclude.has(l.name) && stockOf(sku, l.name) >= qty).map(l => {
+    const covers = siblings.filter(s => stockOf(s.sku, l.name) >= s.qty).length;
+    const dist = hasPos && l.lat != null ? km(order, l) : null;
+    let score;
+    if (dist != null) score = dist - covers * NUDGE_KM;
+    else {   // fallback: province order, expressed in "km" so it sorts after any store with a real distance
+      score = (near.indexOf(l.province_code) < 0 ? 9 : near.indexOf(l.province_code)) * 500 + 5000;
+      if (city && l.city && l.city.toLowerCase() === city) score -= 250;
+      score -= covers * 150;
+    }
+    return { loc: l, score, qty: stockOf(sku, l.name), covers, km: dist };
+  }).sort((a, b) => a.score - b.score || b.qty - a.qty).slice(0, limit);
+}
+const kmLabel = s => s.km == null ? '' : s.km < 10 ? `${s.km.toFixed(1)} km` : `${Math.round(s.km)} km`;
+function suggestStores(line, limit = 4) {
   // Other open items on the same order still needing a store: prefer a store that can do them all
   const siblings = S.lines.filter(l => l.order_name === line.order_name && l.id !== line.id && ['new','bad'].includes(stageOf(l).key));
-  const cands = S.locations.filter(l => l.sourceable && !l.is_hq && !tried.has(l.name) && avail(line.sku, l.name) >= line.qty);
-  return cands.map(l => {
-    let score = near.indexOf(l.province_code); if (score < 0) score = 9;
-    if (city && l.city && l.city.toLowerCase() === city) score -= 0.5;
-    const covers = siblings.filter(s => avail(s.sku, l.name) >= s.qty).length;
-    score -= covers * 0.3;
-    return { loc: l, score, qty: avail(line.sku, l.name), covers };
-  }).sort((a, b) => a.score - b.score || b.qty - a.qty).slice(0, limit);
+  return rankStores({ sku: line.sku, qty: line.qty, order: S.orders[line.order_name] || {}, siblings,
+    exclude: new Set(attemptsFor(line).map(a => a.location_name)), limit });
 }
 
 // ---------- data ----------
@@ -375,66 +394,136 @@ function closeModal() { document.getElementById('modalRoot').textContent = ''; }
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
 // ---------- add short pick ----------
+// Type order numbers with the short item(s) — last SKU digits, full SKU or part of the name — one order per
+// line. Every order is looked up in Shopify; nothing is saved with an unknown SKU. Each ticked item gets a
+// source: HQ recheck when HQ's system shows stock, otherwise the closest store with stock (changeable).
+function parsePickInput(text) {
+  const out = [];
+  for (const raw of String(text).split(/\n|;/)) {
+    const parts = raw.trim().split(/[\s,]+/).filter(Boolean);
+    if (!parts.length) continue;
+    const order = normOrder(parts[0]);
+    if (!/^FOM\d{5,7}$/.test(order)) { out.push({ bad: raw.trim() }); continue; }
+    out.push({ order, tokens: parts.slice(1).map(t => t.toLowerCase()) });
+  }
+  return out;
+}
+const tokenMatches = (li, t) => /^\d+$/.test(t) ? String(li.sku || '').endsWith(t) : String(li.name || '').toLowerCase().includes(t);
+
 function openAddShortPick() {
   closeModal();
-  const input = h('input', { class:'input', placeholder:'Order number, e.g. 307000', style:'flex:1' });
-  const out = h('div', { class:'pick-list' });
+  const input = h('textarea', { class:'input', rows: 3, style:'width:100%;resize:vertical;font-family:"Geist Mono",ui-monospace,monospace',
+    placeholder:'307861 5249\n307000\n306451 loafer', 'aria-label':'Orders and short items' });
   const status = h('div');
-  const manualSku = h('input', { class:'input', placeholder:'SKU' });
-  const manualName = h('input', { class:'input', placeholder:'Item name', style:'flex:1' });
-  let fetched = null;
+  const out = h('div', { class:'pick-orders' });
+  const addBtn = h('button', { class:'btn primary', disabled: true }, 'Add to sourcing');
+  let picks = [];   // { order, ship, li, checkbox, select }
+
+  function refreshButton() {
+    const n = picks.filter(p => p.checkbox.checked).length;
+    addBtn.disabled = !n;
+    addBtn.textContent = n ? `Add ${n} item${n === 1 ? '' : 's'} to sourcing` : 'Add to sourcing';
+  }
 
   async function lookup() {
-    const name = normOrder(input.value);
-    if (!name) return;
-    status.replaceChildren(h('div', { class:'muted' }, 'Looking up ' + name + ' in Shopify…'));
-    out.textContent = ''; fetched = null;
-    try {
-      fetched = await callSync({ order: name });
-      status.textContent = '';
-      for (const li of fetched.lines) {
-        if (!li.sku) continue;
-        const already = S.lines.some(l => l.order_name === fetched.order && l.sku === li.sku);
-        const hq = (li.stock.find(s => s.location === hqLoc()) || {}).available || 0;
-        const stores = li.stock.filter(s => S.locByName[s.location]?.sourceable && !S.locByName[s.location]?.is_hq).length;
-        out.append(h('label', { class:'pick' },
-          h('input', { type:'checkbox', value: li.sku, disabled: already || li.current === 0 }),
-          h('div', null, h('div', { class:'item-name' }, li.name),
-            h('div', { class:'meta' }, `${li.sku} · qty ${li.quantity} · unfulfilled ${li.unfulfilled}${li.current === 0 ? ' · refunded' : ''}${already ? ' · already on the board' : ''}`),
-            h('div', { class:'stock-row' }, h('span', null, 'HQ ', h('b', null, String(hq))), h('span', null, `${stores} store${stores === 1 ? '' : 's'} with stock`)))));
+    const reqs = parsePickInput(input.value);
+    out.textContent = ''; picks = []; refreshButton();
+    if (!reqs.length) return;
+    status.replaceChildren(h('div', { class:'muted' }, 'Looking up in Shopify…'));
+    const problems = reqs.filter(r => r.bad).map(r => `“${r.bad}” doesn’t start with an order number.`);
+    for (const req of reqs.filter(r => !r.bad)) {
+      let res;
+      try { res = await callSync({ order: req.order }); }
+      catch (e) { problems.push(`${req.order}: ${e.message}`); continue; }
+      const ship = res.ship || {};
+      const stockMap = Object.fromEntries(res.lines.map(li => [li.sku, Object.fromEntries((li.stock || []).map(s => [s.location, s.available]))]));
+      const stockOf = (sku, loc) => stockMap[sku]?.[loc] ?? 0;
+      const usable = res.lines.filter(li => li.sku && li.current > 0);
+      const matched = new Set();
+      for (const t of req.tokens) {
+        const hits = usable.filter(li => tokenMatches(li, t));
+        if (!hits.length) problems.push(`${req.order}: “${t}” doesn’t match any item on the order.`);
+        else if (hits.length > 1 && /^\d+$/.test(t)) problems.push(`${req.order}: “${t}” matches ${hits.length} items – tick the right one.`);
+        else hits.forEach(li => matched.add(li.sku));
       }
-    } catch (e) {
-      status.replaceChildren(h('div', { class:'banner' }, `Couldn’t reach Shopify (${e.message}). Add the item by SKU below instead.`));
+      const card = h('section', { class:'tile' },
+        h('header', { class:'tile-head' },
+          h('div', null, h('div', { class:'tile-title mono' }, req.order), h('div', { class:'muted sm' }, [ship.name, [ship.city, ship.province_code].filter(Boolean).join(', ')].filter(Boolean).join(' · ') || 'No delivery address')),
+          res.fulfillment ? h('span', { class:'badge' }, res.fulfillment.toLowerCase().replace(/_/g, ' ')) : null));
+      const orderPicks = [];
+      for (const li of usable) {
+        const already = S.lines.some(l => l.order_name === req.order && l.sku === li.sku);
+        const qty = Math.max(1, li.unfulfilled || li.quantity || 1);
+        const hq = stockOf(li.sku, hqLoc());
+        const select = h('select', { class:'input', 'aria-label':'Source for ' + li.name });
+        const checkbox = h('input', { type:'checkbox', checked: matched.has(li.sku) && !already, disabled: already, onchange: () => { updateChoices(); refreshButton(); } });
+        const p = { order: req.order, ship, li, qty, hq, select, checkbox, stockOf };
+        orderPicks.push(p); picks.push(p);
+        card.append(h('div', { class:'sub pick-row' },
+          h('label', { class:'pick-main' }, checkbox,
+            h('div', null, h('div', { class:'item-name' }, li.name.replace(/ - /g, ' – ')),
+              h('div', { class:'meta' }, `${li.sku} · qty ${qty}${li.unfulfilled === 0 ? ' · already fulfilled' : ''}${already ? ' · already on the board' : ''}`))),
+          h('div', { class:'pick-source' }, h('span', { class:'muted xs' }, 'Source from'), select)));
+      }
+      if (!usable.length) card.append(h('div', { class:'muted sm' }, 'No items left on this order (all refunded or removed).'));
+      // Fill each source dropdown; ranking accounts for the other ticked items so one store can take the whole order
+      function updateChoices() {
+        for (const p of orderPicks) {
+          const prev = p.select.value;
+          const siblings = orderPicks.filter(o => o !== p && o.checkbox.checked).map(o => ({ sku: o.li.sku, qty: o.qty }));
+          const ranked = rankStores({ sku: p.li.sku, qty: p.qty, order: p.ship, siblings, stockOf: p.stockOf, limit: 8 });
+          const opts = [];
+          if (p.hq > 0) opts.push(['hq', `HQ recheck – system shows ${p.hq}`]);
+          ranked.forEach((s, i) => opts.push([s.loc.name, `${s.loc.short_name} (${s.qty})${s.km != null ? ` – ${kmLabel(s)}` : i === 0 ? ' – closest' : ''}${s.covers ? ` – has ${s.covers} other item${s.covers === 1 ? '' : 's'} too` : ''}`]));
+          opts.push(['later', ranked.length || p.hq > 0 ? 'Decide later' : 'No stock anywhere – decide later']);
+          p.select.replaceChildren(...opts.map(([v, l]) => h('option', { value: v }, l)));
+          p.select.value = opts.some(([v]) => v === prev) && prev ? prev : opts[0][0];
+          p.select.disabled = !p.checkbox.checked;
+        }
+      }
+      updateChoices();
+      out.append(card);
     }
+    status.replaceChildren(...problems.map(t => h('div', { class:'banner', style:'margin-bottom:6px' }, t)));
+    refreshButton();
   }
+
   async function save() {
-    const name = normOrder(input.value);
-    const picked = fetched ? [...out.querySelectorAll('input:checked')].map(i => fetched.lines.find(l => l.sku === i.value)) : [];
-    const rows = picked.map(li => ({ order_name: fetched.order, sku: li.sku, item_name: li.name.replace(/ - /g, ' – '), qty: Math.max(1, li.unfulfilled || li.quantity || 1) }));
-    if (manualSku.value.trim()) rows.push({ order_name: name, sku: manualSku.value.trim(), item_name: manualName.value.trim() || manualSku.value.trim(), qty: 1 });
-    if (!name || !rows.length) { toast('Pick at least one item'); return; }
+    const chosen = picks.filter(p => p.checkbox.checked);
+    if (!chosen.length) return;
     closeModal();
+    let toStores = 0, toHq = 0;
     await act(async () => {
-      if (!S.orders[name] && !fetched) { const r = await supa.from('ful_orders').upsert({ order_name: name }, { onConflict:'order_name', ignoreDuplicates:true }); if (r.error) throw r.error; }
-      for (const row of rows) {
-        const hq = avail(row.sku, hqLoc()) || ((fetched?.lines.find(l => l.sku === row.sku)?.stock || []).find(s => s.location === hqLoc())?.available || 0);
-        const r = await supa.from('ful_lines').insert({ ...row, hq_check: hq > 0 ? 'pending' : null, source: 'manual' }).select().single();
+      for (const p of chosen) {
+        const src = p.select.value;
+        const r = await supa.from('ful_lines').insert({ order_name: p.order, sku: p.li.sku, item_name: p.li.name.replace(/ - /g, ' – '),
+          qty: p.qty, hq_check: src === 'hq' ? 'pending' : null, source: 'manual' }).select().single();
         if (r.error) throw r.error;
-        await logEvent(r.data, 'added', hq > 0 ? `Short-picked. HQ system shows ${hq}` : 'Short-picked');
+        await logEvent(r.data, 'added', src === 'hq' ? `Short-picked. HQ system shows ${p.hq}` : 'Short-picked');
+        if (src !== 'hq' && src !== 'later') {
+          const a = await supa.from('ful_attempts').insert({ line_id: r.data.id, location_name: src, status: 'wait' });
+          if (a.error) throw a.error;
+          await logEvent(r.data, 'store_assigned', short(src));
+          toStores++;
+        } else if (src === 'hq') toHq++;
       }
-    }, `${rows.length} item${rows.length === 1 ? '' : 's'} added`);
+    }, `${chosen.length} item${chosen.length === 1 ? '' : 's'} added`);
+    S.cat = toStores ? 'to_check' : toHq ? 'hq_check' : 'need';
+    render();
   }
 
   const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
-    h('div', { class:'modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Add short pick' },
+    h('div', { class:'modal wide-modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Add short pick' },
       h('div', { class:'modal-head' }, h('div', { class:'card-title' }, 'Add short-picked items'),
         h('button', { class:'btn sm ghost', style:'margin-left:auto', onclick: closeModal }, 'Close')),
       h('div', { class:'modal-body' },
-        h('form', { class:'search', onsubmit: e => { e.preventDefault(); lookup(); } }, input, h('button', { class:'btn', type:'submit' }, 'Look up')),
-        status, out,
-        h('div', { class:'section-title' }, 'Or add by SKU'),
-        h('div', { class:'search' }, manualSku, manualName)),
-      h('div', { class:'modal-foot' }, h('button', { class:'btn gold', onclick: save }, 'Add to sourcing'))));
+        h('div', { class:'muted sm' }, 'One order per line: the order number, then the short item – last digits of the SKU, the full SKU or part of the name. Leave the item out to choose from the order.'),
+        h('form', { onsubmit: e => { e.preventDefault(); lookup(); }, style:'display:flex;flex-direction:column;gap:10px' },
+          input, h('button', { class:'btn', type:'submit', style:'align-self:flex-start' }, 'Look up in Shopify')),
+        status, out),
+      h('div', { class:'modal-foot' }, h('button', { class:'btn ghost', onclick: closeModal }, 'Cancel'), addBtn)));
+  addBtn.addEventListener('click', save);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); lookup(); } });
   document.getElementById('modalRoot').append(bg);
   input.focus();
 }
@@ -551,8 +640,8 @@ function itemTile(x, items) {
     const sug = suggestStores(line);
     actions = [
       h('div', { class:'chips' }, sug.length ? sug.map((s, i) => isAdmin()
-        ? h('button', { class:'chip' + (i === 0 ? ' best' : ''), title: s.covers ? `Can also supply ${s.covers} other item(s) on this order` : null, onclick: () => assignStore(line, s.loc.name) }, (i === 0 ? '★ ' : '') + s.loc.short_name, h('span', { class:'q' }, s.qty))
-        : h('span', { class:'chip static' + (i === 0 ? ' best' : '') }, s.loc.short_name, h('span', { class:'q' }, s.qty)))
+        ? h('button', { class:'chip' + (i === 0 ? ' best' : ''), title: s.covers ? `Can also supply ${s.covers} other item(s) on this order` : null, onclick: () => assignStore(line, s.loc.name) }, (i === 0 ? '★ ' : '') + s.loc.short_name, h('span', { class:'q' }, s.qty), s.km != null ? h('span', { class:'q' }, kmLabel(s)) : null)
+        : h('span', { class:'chip static' + (i === 0 ? ' best' : '') }, s.loc.short_name, h('span', { class:'q' }, s.qty), s.km != null ? h('span', { class:'q' }, kmLabel(s)) : null))
         : h('span', { class:'note' }, 'No store has stock. Refund, or offer a swap.')),
       isAdmin() ? h('div', { class:'actions' },
         h('button', { class:'btn ghost sm', onclick: () => openFoundAtHq(line) }, 'Found at HQ'),
@@ -753,18 +842,24 @@ function renderAdjust(main) {
 
 function renderStores(main) {
   main.append(h('div', { class:'page-head' }, h('div', null, h('div', { class:'page-title' }, 'Stores'),
-    h('div', { class:'page-sub' }, 'Email addresses used on drafts, the province used for "closest store", and which locations can be suggested.'))));
-  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Location','Province','City','Email','Suggest',''].map(t => h('th', null, t))));
+    h('div', { class:'page-sub' }, 'Email addresses used on drafts, map positions used to find the closest store, and which locations can be suggested. Map position: copy “latitude, longitude” from Google Maps (right-click the store).'))));
+  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Location','Province','City','Map position','Email','Suggest',''].map(t => h('th', null, t))));
   for (const l of S.locations) {
     const email = h('input', { class:'input', value: l.email || '', style:'width:100%', type:'email', 'aria-label':'Email for ' + l.name });
     const prov = h('select', { class:'input', 'aria-label':'Province for ' + l.name }, ...Object.keys(PROV_NEAR).map(p => h('option', { value:p, selected: l.province_code === p }, p === 'NL' ? 'NL (KZN)' : p)));
     const city = h('input', { class:'input', value: l.city || '', style:'width:100%', 'aria-label':'City for ' + l.name });
+    const pos = h('input', { class:'input mono', value: l.lat != null ? `${l.lat}, ${l.lng}` : '', placeholder:'-33.89, 18.51', style:'width:100%;min-width:130px', 'aria-label':'Map position for ' + l.name });
     const sug = h('input', { type:'checkbox', checked: l.sourceable, 'aria-label':'Suggest ' + l.name });
-    tbl.append(h('tr', null, h('td', null, l.name, l.is_hq ? h('span', { class:'badge b-sent', style:'margin-left:6px' }, 'HQ') : null), h('td', null, prov), h('td', null, city), h('td', null, email), h('td', null, sug),
-      h('td', null, h('button', { class:'btn sm', onclick: () => act(async () => {
-        const r = await supa.from('ful_locations').update({ email: email.value.trim() || null, province_code: prov.value, city: city.value.trim() || null, sourceable: sug.checked }).eq('name', l.name);
-        if (r.error) throw r.error;
-      }, 'Saved ' + l.short_name) }, 'Save'))));
+    tbl.append(h('tr', null, h('td', null, l.name, l.is_hq ? h('span', { class:'badge b-sent', style:'margin-left:6px' }, 'HQ') : null), h('td', null, prov), h('td', null, city), h('td', null, pos), h('td', null, email), h('td', null, sug),
+      h('td', null, h('button', { class:'btn sm', onclick: () => {
+        const m = pos.value.trim().match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
+        const lat = m ? Number(m[1]) : null, lng = m ? Number(m[2]) : null;
+        if (pos.value.trim() && !(m && lat >= -35.5 && lat <= -21.5 && lng >= 16 && lng <= 33.5)) { toast('Map position should look like -33.89, 18.51 (a South African location)'); return; }
+        act(async () => {
+          const r = await supa.from('ful_locations').update({ email: email.value.trim() || null, province_code: prov.value, city: city.value.trim() || null, lat, lng, sourceable: sug.checked }).eq('name', l.name);
+          if (r.error) throw r.error;
+        }, 'Saved ' + l.short_name);
+      } }, 'Save'))));
   }
   main.append(h('div', { class:'card', style:'overflow-x:auto' }, tbl));
 }
@@ -809,6 +904,41 @@ document.getElementById('loginForm').addEventListener('submit', async e => {
   start(data.session);
 });
 document.getElementById('signOut').addEventListener('click', async () => { await supa.auth.signOut(); location.reload(); });
+
+// Change password: re-checks the current password first, so an unattended signed-in screen can't be used to take over the account
+const MIN_PW = 8;
+function openChangePassword() {
+  closeModal();
+  const field = (label, auto) => { const i = h('input', { class:'input', type:'password', autocomplete: auto, required: true }); return [i, h('label', { class:'pw-field' }, label, i)]; };
+  const [cur, curL] = field('Current password', 'current-password');
+  const [nw, nwL] = field(`New password (at least ${MIN_PW} characters)`, 'new-password');
+  const [rep, repL] = field('New password again', 'new-password');
+  const msg = h('div', { class:'banner err', role:'alert', hidden: true });
+  const save = h('button', { class:'btn primary', type:'submit' }, 'Change password');
+  const fail = t => { msg.textContent = t; msg.hidden = false; save.disabled = false; save.textContent = 'Change password'; };
+  const form = h('form', { class:'modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Change password', onsubmit: async e => {
+    e.preventDefault();
+    msg.hidden = true;
+    if (nw.value.length < MIN_PW) return fail(`The new password needs at least ${MIN_PW} characters.`);
+    if (nw.value !== rep.value) return fail('The two new passwords don’t match.');
+    if (nw.value === cur.value) return fail('The new password is the same as the current one.');
+    save.disabled = true; save.textContent = 'Saving…';
+    const re = await supa.auth.signInWithPassword({ email: S.email, password: cur.value });
+    if (re.error) return fail('The current password is wrong.');
+    const { error } = await supa.auth.updateUser({ password: nw.value });
+    if (error) return fail('Couldn’t change it: ' + error.message);
+    closeModal();
+    toast('Password changed');
+  } },
+    h('div', { class:'modal-head' }, h('div', { class:'card-title' }, 'Change password'), h('span', { class:'muted' }, S.email),
+      h('button', { class:'btn sm ghost', type:'button', style:'margin-left:auto', onclick: closeModal }, 'Close')),
+    h('div', { class:'modal-body' }, curL, nwL, repL, msg),
+    h('div', { class:'modal-foot' }, h('button', { class:'btn ghost', type:'button', onclick: closeModal }, 'Cancel'), save));
+  const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } }, form);
+  document.getElementById('modalRoot').append(bg);
+  cur.focus();
+}
+document.getElementById('changePw').addEventListener('click', openChangePassword);
 supa.auth.getSession().then(({ data }) => start(data.session));
 // Keep the board fresh while it's open
 setInterval(() => {

@@ -188,6 +188,17 @@ a.btn{text-decoration:none}
 .login h1{font-size:24px;font-weight:600;letter-spacing:-.02em}
 .login label{font-size:13px;color:var(--text-2);display:flex;flex-direction:column;gap:6px}
 
+/* Add short pick */
+.modal.wide-modal{width:min(980px,100%)}
+.pick-orders{display:flex;flex-direction:column;gap:14px}
+.pick-row{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;justify-content:space-between}
+.pick-main{display:flex;gap:12px;align-items:flex-start;flex:1 1 320px;min-width:0;cursor:pointer}
+.pick-main input{margin-top:4px;width:16px;height:16px;flex-shrink:0}
+.pick-source{display:flex;flex-direction:column;gap:4px;flex:0 1 300px;min-width:220px}
+.pick-source select{width:100%}
+.pick-source select:disabled{opacity:.4}
+.pw-field{font-size:13px;color:var(--text-2);display:flex;flex-direction:column;gap:6px}
+
 /* modal */
 .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.7);backdrop-filter:blur(2px);display:flex;align-items:flex-start;justify-content:center;padding:6vh 16px;z-index:20;overflow:auto}
 .modal{width:min(760px,100%);background:var(--tile);border:1px solid var(--border-2);border-radius:var(--r-tile);display:flex;flex-direction:column}
