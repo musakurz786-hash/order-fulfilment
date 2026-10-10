@@ -622,10 +622,25 @@ function draftFollowUp(locName, items, pairs) {
   const text = `Hi ${team} team,\n\n${lead}\n\n${itemText(items)}\n\n${stockLine(items, locName)}\n\n${ask}\n\nThanks,\n${CONFIG.SIGN_OFF}`;
   return { to: S.locByName[locName]?.email || '', subject, html, text };
 }
+// Follow-up to a store after the collection email: has Aramex collected the parcel yet?
+function draftCollectFollowUp(locName, items, pairs) {
+  const team = short(locName);
+  const many = items.length > 1;
+  const o = S.orders[items[0].order_name] || {};
+  const first = pairs.map(p => p.att.collect_mail_at).filter(Boolean).sort()[0];
+  const sentOn = first ? new Date(first).toLocaleDateString('en-ZA', { weekday:'long', day:'numeric', month:'long' }) : 'earlier';
+  const subject = `Follow-up: Aramex collection – ${ordersPhrase(items.map(l => l.order_name))}${o.customer_name ? ' – ' + o.customer_name : ''}`;
+  const lead = `Just following up on the Aramex collection I booked on ${sentOn} for the item${many ? 's' : ''} below. Has Aramex collected the parcel yet?`;
+  const ask = 'Please reply to confirm it has left your store. If the driver hasn’t come yet, let me know so I can follow up with Aramex.';
+  const html = `<p>Hi ${esc(team)} team,</p><p>${esc(lead)}</p>${itemTable(items)}<p><b>${esc(ask)}</b></p><p>Thanks,<br>${esc(CONFIG.SIGN_OFF)}</p>`;
+  const text = `Hi ${team} team,\n\n${lead}\n\n${itemText(items)}\n\n${ask}\n\nThanks,\n${CONFIG.SIGN_OFF}`;
+  return { to: S.locByName[locName]?.email || '', subject, html, text };
+}
 const DRAFT_KINDS = {
   stock:   { title:'Stock check email',  field:'stock_mail_at',   event:'stock_mail',   make: (loc, items) => draftStockCheck(loc, items) },
   followup:{ title:'Follow-up email',    field:'followup_mail_at', event:'followup_mail', make: (loc, items, pairs) => draftFollowUp(loc, items, pairs) },
   collect: { title:'Collection email',   field:'collect_mail_at', event:'collect_mail', make: (loc, items, pairs) => draftCollection(loc, items, pairs) },
+  collect_followup: { title:'Collection follow-up email', field:'collect_followup_at', event:'collect_followup_mail', make: (loc, items, pairs) => draftCollectFollowUp(loc, items, pairs) },
   release: { title:'No longer needed email', field:'release_mail_at', event:'release_mail', make: (loc, items, pairs) => draftRelease(loc, items, pairs) },
 };
 
@@ -841,6 +856,7 @@ function mailLine(att) {
     row('Store replied', att.replied_at, 'Waiting'),
     hasWaybill(att) ? row('Waybill ' + att.waybill_number, att.waybill_created_at, '') : null,
     row('Collection emailed', att.collect_mail_at, 'Not yet'),
+    att.collect_followup_at ? row('Collection followed up', att.collect_followup_at, '') : null,
     att.collected_at ? row('Collected', att.collected_at, '') : null,
     att.delivered_at ? row('Delivered', att.delivered_at, '') : null);
 }
@@ -866,7 +882,7 @@ function itemBlock(line, st, parts, ...actions) {
 }
 const fact = (label, value) => h('div', { class:'fact' }, h('span', { class:'fact-l' }, label), h('span', { class:'fact-v' }, value));
 
-const MAIL_ACTION_LABEL = a => ({ stock_mail:'mark stock check emailed', followup_mail:'mark follow-up emailed', release_mail:'mark “no longer needed” emailed', collect_mail:'mark collection emailed', 'status:ok':'store has stock',
+const MAIL_ACTION_LABEL = a => ({ stock_mail:'mark stock check emailed', followup_mail:'mark follow-up emailed', release_mail:'mark “no longer needed” emailed', collect_mail:'mark collection emailed', collect_followup_mail:'mark collection follow-up emailed', 'status:ok':'store has stock',
   'status:bad':'store has no stock', 'status:hold':'put on hold', collected:'mark collected' })[a] || a;
 async function reviewFlag(f, accept) {
   await act(async () => {
@@ -970,6 +986,17 @@ function itemTile(x, items) {
       const fresh = pairs.filter(p => !p.att.waybill_number);
       if (CONFIG.ARAMEX_ENABLED) actions.push(h('button', { class:'btn gold sm block', onclick: () => openWaybill(loc, fresh) }, `Create waybill & book collection${fresh.length > 1 ? ` (${fresh.length} items)` : ''}`));
       actions.push(h('button', { class:'btn ' + (CONFIG.ARAMEX_ENABLED ? 'outline' : 'primary') + ' sm block', onclick: () => openDraft('collect', loc, pairs) }, `Collection email${CONFIG.ARAMEX_ENABLED ? ' only' : ''} · ${line.order_name}${n}`));
+    }
+  }
+  if (x.cat === 'aramex') {
+    // How long since the collection email (or the last collection follow-up) without a "parcel has left" reply
+    const since = st.att.collect_followup_at || st.att.collect_mail_at;
+    tag = h('div', { class:'waiting-for ' + (ageHours(since) >= 20 ? 'late' : '') },
+      `Not confirmed collected for ${ageText(since)}${st.att.collect_followup_at ? ' since the follow-up' : ''}`);
+    if (isAdmin()) {
+      const batch = items.filter(y => y.cat === 'aramex' && y.st.att.location_name === loc && y.line.order_name === line.order_name);
+      actions.push(h('button', { class:'btn outline sm block', onclick: () => openDraft('collect_followup', loc, batch.map(y => ({ line:y.line, att:y.st.att }))) },
+        `Collection follow-up · ${line.order_name}${batch.length > 1 ? ` (${batch.length} items)` : ''}`));
     }
   }
   if (x.cat === 'aramex' && isAdmin() && hasWaybill(st.att) && st.att.waybill_pdf) {
@@ -1115,6 +1142,7 @@ function renderLookup(main) {
           if (a.release_mail_at) tl.push([a.release_mail_at, `“No longer needed” email sent to ${short(a.location_name)}`]);
           if (hasWaybill(a)) tl.push([a.waybill_created_at, `Aramex waybill ${a.waybill_number} created${a.collection_ref ? ` – collection booked for ${a.collection_date} (ref ${a.collection_ref})` : ''}`]);
           if (a.collect_mail_at) tl.push([a.collect_mail_at, `Collection email sent to ${short(a.location_name)}`]);
+          if (a.collect_followup_at) tl.push([a.collect_followup_at, `Collection follow-up email sent to ${short(a.location_name)}`]);
           if (a.collected_at) tl.push([a.collected_at, `Collected from ${short(a.location_name)}`]);
           for (const t of a.aramex_events || []) if (t.at && !isNaN(new Date(t.at))) tl.push([new Date(t.at).toISOString(), `Aramex: ${t.text}${t.location ? ' (' + t.location + ')' : ''}`]);
         }
