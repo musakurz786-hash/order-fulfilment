@@ -266,3 +266,11 @@ table.plain .input{padding:7px 12px}
   .grid,.grid.wide{grid-template-columns:minmax(0,1fr)}
   .tile{padding:16px;border-radius:18px}
 }
+
+/* Order notes, customer update, "Needs me today" */
+.notes{display:flex;flex-direction:column;gap:8px}
+.order-note{background:var(--tile-2);border:1px solid var(--border);border-radius:12px;padding:8px 12px;display:flex;flex-direction:column;gap:2px}
+.order-note .sm{white-space:pre-wrap;overflow-wrap:anywhere}
+.link-btn{background:none;border:0;padding:0 0 0 8px;color:var(--text-2);font:inherit;font-size:12px;text-decoration:underline;cursor:pointer}
+.card-actions{display:flex;gap:8px;flex-wrap:wrap;padding-top:4px}
+.today .flag-main .item-name{font-size:14px}

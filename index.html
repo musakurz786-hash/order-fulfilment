@@ -51,7 +51,7 @@ const PROV_NEAR = {
   NL:['NL','MP','FS','GP','EC','NW','LP','NC','WC'], MP:['MP','GP','LP','NL','NW','FS','NC','EC','WC'],
   LP:['LP','GP','MP','NW','NL','FS','NC','EC','WC'],
 };
-const STATUS_LABEL = { wait:'Waiting', ok:'Has stock', bad:'No stock', hold:'On hold', sent:'Collected', released:'Released' };
+const STATUS_LABEL = { wait:'Waiting', ok:'Has stock', bad:'No stock', hold:'On hold', sent:'Collected', released:'Released', noreply:'No reply' };
 
 // ---------- helpers ----------
 function h(tag, attrs, ...kids) {
@@ -91,7 +91,7 @@ function stageOf(line) {
   if (line.state === 'hq_found') return { key:'hq', label:'Found at HQ', att };
   if (line.hq_check === 'pending' && !att) return { key:'hq_check', label:'Warehouse rechecking', att };
   if (!att) return { key:'new', label:'Needs a store', att };
-  if (att.status === 'bad') return { key:'bad', label:'No stock – find another store', att };
+  if (att.status === 'bad' || att.status === 'noreply') return { key:'bad', label: att.status === 'noreply' ? 'No reply – find another store' : 'No stock – find another store', att };
   if (att.status === 'wait') return { key:'wait', label: att.stock_mail_at ? 'Waiting for store' : 'Stock check to send', att };
   if (att.status === 'ok') return { key:'ok', label: att.collect_mail_at ? 'Awaiting Aramex' : 'Store has it – book collection', att };
   if (att.status === 'hold') return { key:'hold', label:'On hold', att };
@@ -105,7 +105,7 @@ function sayFor(line, st) {
     case 'hq': return 'The warehouse found it. It ships from HQ.';
     case 'hq_check': return `The warehouse system shows ${avail(line.sku, hqLoc())} at HQ. The warehouse is checking again.`;
     case 'new': return 'Being sourced. A store has not been asked yet.';
-    case 'bad': return `${s} doesn't have it. We're asking another store.`;
+    case 'bad': return st.att.status === 'noreply' ? `${s} didn't reply. We're asking another store.` : `${s} doesn't have it. We're asking another store.`;
     case 'wait': return st.att.stock_mail_at ? `Stock check sent to ${s}. Waiting for the store to reply.` : `${s} will be asked to check stock.`;
     case 'ok': return st.att.collect_mail_at || st.att.collection_ref
       ? `${s} has it set aside. Aramex collection has been requested${hasWaybill(st.att) ? ` (waybill ${st.att.waybill_number})` : ''}.`
@@ -178,7 +178,7 @@ async function loadAll() {
   const orderNames = [...new Set(S.lines.map(l => l.order_name))];
   const skus = [...new Set(S.lines.map(l => l.sku))];
   const chunks = (a, n) => Array.from({ length: Math.ceil(a.length / n) }, (_, i) => a.slice(i * n, i * n + n));
-  const att = [], ord = [], st = [], ev = [];
+  const att = [], ord = [], st = [], ev = [], notes = [];
   for (const c of chunks(ids, 200)) {
     const [a, e] = await Promise.all([
       supa.from('ful_attempts').select('*').in('line_id', c),
@@ -188,8 +188,10 @@ async function loadAll() {
     att.push(...a.data); ev.push(...e.data);
   }
   for (const c of chunks(orderNames, 200)) { const r = await supa.from('ful_orders').select('*').in('order_name', c); if (r.error) throw r.error; ord.push(...r.data); }
+  for (const c of chunks(orderNames, 200)) { const r = await supa.from('ful_order_notes').select('*').in('order_name', c).order('created_at'); if (r.error) throw r.error; notes.push(...r.data); }
   for (const c of chunks(skus, 100)) { const r = await supa.from('ful_stock').select('sku,location_name,available,synced_at').in('sku', c).limit(10000); if (r.error) throw r.error; st.push(...r.data); }
   S.attempts = att; S.events = ev;
+  S.notes = {}; for (const n of notes) (S.notes[n.order_name] ||= []).push(n);
   S.orders = Object.fromEntries(ord.map(o => [o.order_name, o]));
   S.stock = {}; S.stockAt = {};
   for (const r of st) { (S.stock[r.sku] ||= {})[r.location_name] = r.available; if (!S.stockAt[r.sku] || r.synced_at > S.stockAt[r.sku]) S.stockAt[r.sku] = r.synced_at; }
@@ -225,7 +227,7 @@ async function setAttemptStatus(line, att, v) {
 
 // "No stock" chooser: next closest stores with stock (stores already asked are left out). Picking one creates the
 // new store request, so the item lands in "Stock check to send" for that store.
-function openNextStore(lineId, fromLoc) {
+function openNextStore(lineId, fromLoc, why = 'No stock at') {
   const line = S.lines.find(l => l.id === lineId);
   if (!line) return;
   closeModal();
@@ -238,7 +240,7 @@ function openNextStore(lineId, fromLoc) {
     : h('div', { class:'banner' }, 'No other store has stock of this item.');
   const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
     h('div', { class:'modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Ask another store' },
-      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, `No stock at ${short(fromLoc)}`), h('span', { class:'muted' }, line.order_name),
+      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, `${why} ${short(fromLoc)}`), h('span', { class:'muted' }, line.order_name),
         h('button', { class:'btn sm ghost', style:'margin-left:auto', onclick: closeModal }, 'Close')),
       h('div', { class:'modal-body' },
         h('div', { class:'item-name' }, line.item_name), h('div', { class:'meta' }, `${line.sku} · qty ${line.qty}`),
@@ -250,13 +252,30 @@ function openNextStore(lineId, fromLoc) {
   document.getElementById('modalRoot').append(bg);
 }
 
+// The store never replied: close its request as "No reply" (every item of the order still waiting on it) and
+// offer the next closest store, like "No stock".
+async function moveOnFromStore(line) {
+  const att = attemptsFor(line)[0];
+  if (!att || att.status !== 'wait') return;
+  const same = S.lines.filter(l => l.order_name === line.order_name && l.state === 'open')
+    .map(l => ({ line: l, att: attemptsFor(l)[0] })).filter(p => p.att && p.att.status === 'wait' && p.att.location_name === att.location_name);
+  if (!confirm(`${short(att.location_name)} hasn't replied. Stop waiting for them and ask another store for ${same.length > 1 ? `these ${same.length} items` : 'this item'}?`)) return;
+  await act(async () => {
+    const r = await supa.from('ful_attempts').update({ status: 'noreply' }).in('id', same.map(p => p.att.id));
+    if (r.error) throw r.error;
+    for (const p of same) await logEvent(p.line, 'status', `${short(att.location_name)}: No reply – asking another store`);
+  });
+  if (same.length === 1) openNextStore(line.id, att.location_name, 'No reply from');
+  else { S.cat = 'need'; render(); toast(`${same.length} items moved to Needs a store`); }
+}
+
 // Whole order vs split shipment: does this store's share cover every item still on the Shopify order?
 function shipmentOf(line, loc) {
   const total = S.orders[line.order_name]?.item_count;
   if (!loc || total == null) return null;
   const here = S.lines.filter(l => l.order_name === line.order_name && l.state === 'open').reduce((n, l) => {
     const a = attemptsFor(l)[0];
-    return a && a.location_name === loc && !['bad','released'].includes(a.status) ? n + l.qty : n;
+    return a && a.location_name === loc && !['bad','released','noreply'].includes(a.status) ? n + l.qty : n;
   }, 0);
   const fromStore = Math.max(here, line.qty);
   return { total, here: fromStore, split: total > fromStore };
@@ -700,6 +719,35 @@ function parsePickInput(text) {
 }
 const tokenMatches = (li, t) => /^\d+$/.test(t) ? String(li.sku || '').endsWith(t) : String(li.name || '').toLowerCase().includes(t);
 
+// Picking slip reader: text from a PDF (pdf.js), or OCR for a photo (Tesseract) — both load only when first used,
+// and the file never leaves this browser. Returns the FOM order numbers on it, in slip order.
+const loadScript = src => new Promise((ok, fail) => {
+  if (document.querySelector(`script[src="${src}"]`)) return ok();
+  document.head.append(h('script', { src, onload: ok, onerror: () => fail(new Error('couldn’t load the reader')) }));
+});
+async function ordersFromSlip(file, progress) {
+  let text = '';
+  if (file.type === 'application/pdf' || /\.pdf$/i.test(file.name)) {
+    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const c = await (await pdf.getPage(p)).getTextContent();
+      text += c.items.map(i => i.str).join(' ') + '\n';
+      progress(Math.round(100 * p / pdf.numPages));
+    }
+  }
+  if (!text.trim()) {   // a photo, or a scanned PDF with no text layer
+    if (!file.type.startsWith('image/')) throw new Error('this PDF has no text – take a photo of the slip instead');
+    await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js');
+    const r = await Tesseract.recognize(file, 'eng', { logger: m => m.status === 'recognizing text' && progress(Math.round(m.progress * 100)) });
+    text = r.data.text;
+  }
+  // "FOM307000", "FOM 307000", "#307000" (OCR often reads O as 0)
+  const found = [...text.toUpperCase().matchAll(/(?:F[O0]M|#)\s*#?\s*(\d{6})\b/g)].map(m => 'FOM' + m[1]);
+  return [...new Set(found)];
+}
+
 function openAddShortPick() {
   closeModal();
   const input = h('textarea', { class:'input', rows: 3, style:'width:100%;resize:vertical;font-family:"Geist Mono",ui-monospace,monospace',
@@ -803,6 +851,28 @@ function openAddShortPick() {
     render();
   }
 
+  // Picking slip (PDF or photo): read the order numbers off it, add them to the box and look them up.
+  // You still tick the short items per order — the slip doesn't say which ones are missing.
+  const slipFile = h('input', { type:'file', accept:'application/pdf,image/*', hidden: true, onchange: async () => {
+    const file = slipFile.files[0];
+    slipFile.value = '';
+    if (!file) return;
+    slipBtn.disabled = true; slipBtn.textContent = 'Reading slip…';
+    try {
+      const orders = await ordersFromSlip(file, p => { slipBtn.textContent = `Reading slip… ${p}%`; });
+      const have = new Set(parsePickInput(input.value).map(r => r.order));
+      const fresh = orders.filter(o => !have.has(o));
+      if (!orders.length) toast('No order numbers found on that slip');
+      else {
+        input.value = [input.value.trim(), ...fresh].filter(Boolean).join('\n');
+        toast(`Found ${orders.length} order${orders.length === 1 ? '' : 's'} on the slip`);
+        await lookup();
+      }
+    } catch (e) { toast('Couldn’t read the slip: ' + (e.message || e)); }
+    slipBtn.disabled = false; slipBtn.textContent = 'Read picking slip';
+  } });
+  const slipBtn = h('button', { class:'btn outline', type:'button', onclick: () => slipFile.click() }, 'Read picking slip');
+
   const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
     h('div', { class:'modal wide-modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Add short pick' },
       h('div', { class:'modal-head' }, h('div', { class:'card-title' }, 'Add short-picked items'),
@@ -810,7 +880,9 @@ function openAddShortPick() {
       h('div', { class:'modal-body' },
         h('div', { class:'muted sm' }, 'One order per line: the order number, then the short item – last digits of the SKU, the full SKU or part of the name. Leave the item out to choose from the order.'),
         h('form', { onsubmit: e => { e.preventDefault(); lookup(); }, style:'display:flex;flex-direction:column;gap:10px' },
-          input, h('button', { class:'btn', type:'submit', style:'align-self:flex-start' }, 'Look up in Shopify')),
+          input, h('div', { class:'actions' },
+            h('button', { class:'btn', type:'submit' }, 'Look up in Shopify'),
+            slipBtn, slipFile)),
         status, out),
       h('div', { class:'modal-foot' }, h('button', { class:'btn ghost', onclick: closeModal }, 'Cancel'), addBtn)));
   addBtn.addEventListener('click', save);
@@ -829,7 +901,7 @@ function renderTabs() {
     ['board', 'Sourcing', openCount],
     ['lookup', 'Order lookup'],
     ['refunds', 'Refunds', toRefund],
-    ...(isAdmin() ? [['adjust', 'HQ stock adjustments', adjOpen], ['stores', 'Stores']] : []),
+    ...(isAdmin() ? [['reports', 'Reports'], ['adjust', 'HQ stock adjustments', adjOpen], ['stores', 'Stores']] : []),
   ];
   document.getElementById('tabs').replaceChildren(...tabs.map(([k, label, n]) =>
     h('button', { class:'tab', role:'tab', 'aria-selected': String(S.view === k), onclick: () => { S.view = k; render(); } }, label, n ? h('span', { class:'n' }, n) : null)));
@@ -952,7 +1024,7 @@ function itemTile(x, items) {
       isAdmin() ? h('div', { class:'actions' },
         h('button', { class:'btn ghost sm', onclick: () => openFoundAtHq(line) }, 'Found at HQ'),
         h('button', { class:'btn ghost sm', onclick: () => { if (confirm(`Mark ${line.order_name} – ${line.item_name} for refund?`)) setLine(line, { state:'refund' }, 'refund', 'Marked for refund'); } }, 'Mark for refund')) : null];
-    const extra = [where, st.key === 'bad' ? h('div', { class:'note' }, `${short(loc)} had no stock`) : null];
+    const extra = [where, st.key === 'bad' ? h('div', { class:'note' }, st.att.status === 'noreply' ? `${short(loc)} didn't reply` : `${short(loc)} had no stock`) : null];
     return h('section', { class:'tile' }, itemBlock(line, st, { meta, extra, stock: stockSummary(line) }, ...actions));
   }
   // Store categories: the email button drafts for every item at the same store in the same step
@@ -970,6 +1042,8 @@ function itemTile(x, items) {
       const batch = items.filter(y => y.cat === 'waiting' && y.st.att.location_name === loc);
       actions.push(h('button', { class:'btn outline sm block', onclick: () => openDraft('followup', loc, batch.map(y => ({ line:y.line, att:y.st.att }))) },
         `Follow-up email · ${short(loc)}${batch.length > 1 ? ` (${batch.length} items)` : ''}`));
+      // Quiet for 4 hours or more: offer to move on to the next closest store
+      if (ageHours(since) >= 4) actions.push(h('button', { class:'btn outline sm block', onclick: () => moveOnFromStore(line) }, 'No reply – ask another store'));
     }
   }
   if (isAdmin() && x.cat === 'to_book') {
@@ -1006,7 +1080,60 @@ function itemTile(x, items) {
   }
   actions.push(replyPills(line, st));
   if (isAdmin() && x.cat !== 'done') actions.push(h('button', { class:'btn ghost sm', style:'align-self:flex-start', onclick: () => openFoundAtHq(line) }, 'Found at HQ'));
-  return h('section', { class:'tile' }, itemBlock(line, st, { meta, extra:[where, ship, courierTag(st.att), tag], stock: stockSummary(line, loc), mails: mailLine(st.att) }, ...actions));
+  return h('section', { class:'tile' }, itemBlock(line, st, { meta, extra:[where, ship, courierTag(st.att), tag, latestNote(line.order_name)], stock: stockSummary(line, loc), mails: mailLine(st.att) }, ...actions));
+}
+
+// "Needs me today": everything waiting on the admin, most urgent first, one row per store (or store + order) with
+// the button that deals with it. Store emails batch like the tile buttons do.
+const TODAY_LATE_REPLY_H = 4, TODAY_LATE_COLLECT_H = 20, TODAY_LATE_RECHECK_H = 4;
+function todayRows(items) {
+  const rows = [];
+  const pairsOf = list => list.map(y => ({ line: y.line, att: y.st.att }));
+  const groupBy = (list, key) => list.reduce((m, y) => ((m[key(y)] ||= []).push(y), m), {});
+  const itemsText = list => list.map(y => `${y.line.order_name} · ${y.line.item_name}`).join(' | ');
+  const goTo = cat => () => { S.cat = cat; render(); document.querySelector('.section-head')?.scrollIntoView({ behavior:'smooth' }); };
+
+  for (const y of items.filter(y => y.cat === 'need')) {
+    const loc = y.st.att?.location_name;
+    rows.push({ rank: 0, title: y.st.key === 'bad' ? `${y.st.att.status === 'noreply' ? 'No reply from' : 'No stock at'} ${short(loc)} – pick another store` : 'Pick a store',
+      meta: itemsText([y]), btn: y.st.key === 'bad' ? ['Ask another store', () => openNextStore(y.line.id, loc, y.st.att.status === 'noreply' ? 'No reply from' : 'No stock at')] : ['Choose store', goTo('need')] });
+  }
+  const recheck = items.filter(y => y.cat === 'hq_check' && ageHours(y.line.added_at) >= TODAY_LATE_RECHECK_H);
+  if (recheck.length) rows.push({ rank: 1, title: `Warehouse recheck waiting ${ageText(recheck.map(y => y.line.added_at).sort()[0])}`, meta: itemsText(recheck), btn: ['Open', goTo('hq_check')] });
+  for (const [loc, list] of Object.entries(groupBy(items.filter(y => y.cat === 'waiting' && ageHours(y.st.att.followup_mail_at || y.st.att.stock_mail_at) >= TODAY_LATE_REPLY_H), y => y.st.att.location_name))) {
+    const since = list.map(y => y.st.att.followup_mail_at || y.st.att.stock_mail_at).sort()[0];
+    rows.push({ rank: 2, title: `${short(loc)} hasn't replied for ${ageText(since)}${list.some(y => y.st.att.followup_mail_at) ? ' (followed up)' : ''}`, meta: itemsText(list),
+      btn: list.some(y => y.st.att.followup_mail_at) ? ['Ask another store', () => moveOnFromStore(list[0].line)] : ['Follow-up email', () => openDraft('followup', loc, pairsOf(list))] });
+  }
+  for (const [loc, list] of Object.entries(groupBy(items.filter(y => y.cat === 'to_check'), y => y.st.att.location_name)))
+    rows.push({ rank: 3, title: `Stock check to send · ${short(loc)}`, meta: itemsText(list), btn: ['Stock check email', () => openDraft('stock', loc, pairsOf(list))] });
+  for (const [, list] of Object.entries(groupBy(items.filter(y => y.cat === 'to_book'), y => y.st.att.location_name + '|' + y.line.order_name))) {
+    const loc = list[0].st.att.location_name;
+    rows.push({ rank: 4, title: `${short(loc)} has it – send the collection email`, meta: itemsText(list), btn: ['Collection email', () => openDraft('collect', loc, pairsOf(list))] });
+  }
+  for (const [, list] of Object.entries(groupBy(items.filter(y => y.cat === 'aramex' && ageHours(y.st.att.collect_followup_at || y.st.att.collect_mail_at) >= TODAY_LATE_COLLECT_H), y => y.st.att.location_name + '|' + y.line.order_name))) {
+    const loc = list[0].st.att.location_name;
+    rows.push({ rank: 5, title: `Not confirmed collected from ${short(loc)} for ${ageText(list[0].st.att.collect_followup_at || list[0].st.att.collect_mail_at)}`, meta: itemsText(list),
+      btn: ['Collection follow-up', () => openDraft('collect_followup', loc, pairsOf(list))] });
+  }
+  const hold = items.filter(y => y.cat === 'hold');
+  if (hold.length) rows.push({ rank: 6, title: `${hold.length} item${hold.length === 1 ? '' : 's'} on hold`, meta: itemsText(hold), btn: ['Open', goTo('hold')] });
+  return rows.sort((a, b) => a.rank - b.rank);
+}
+function renderToday(main, items) {
+  const rows = todayRows(items);
+  const LIMIT = 8;
+  const shown = S.todayAll ? rows : rows.slice(0, LIMIT);
+  main.append(h('section', { class:'tile flags today' },
+    h('header', { class:'tile-head' },
+      h('div', null, h('div', { class:'tile-title' }, 'Needs me today'),
+        h('div', { class:'muted sm' }, rows.length ? 'Everything waiting on you, most urgent first.' : 'Nothing waiting on you right now.')),
+      h('span', { class:'badge ' + (rows.length ? 'b-wait' : 'b-sent') }, String(rows.length))),
+    ...shown.map(r => h('div', { class:'flag' },
+      h('div', { class:'flag-main' }, h('div', { class:'item-name' }, r.title), h('div', { class:'meta' }, r.meta)),
+      h('div', { class:'actions' }, h('button', { class:'btn primary sm', onclick: r.btn[1] }, r.btn[0])))),
+    rows.length > LIMIT ? h('button', { class:'btn ghost sm', style:'align-self:flex-start', onclick: () => { S.todayAll = !S.todayAll; render(); } },
+      S.todayAll ? 'Show fewer' : `Show all ${rows.length}`) : null));
 }
 
 function renderBoard(main) {
@@ -1038,6 +1165,8 @@ function renderBoard(main) {
       : `Last Shopify sync failed at ${when(S.lastSync.at)}: ${S.lastSync.detail || 'unknown error'}`));
 
   if (S.lastScan) main.append(h('div', { class:'dim sm', style:'margin-top:-14px' }, `Email scan last ran ${when(S.lastScan)}. Store confirmations update the board automatically, hourly.`));
+
+  if (isAdmin()) renderToday(main, items);
 
   // Items found at HQ while a store had already been asked: send that store a "no longer needed" email
   const releases = Object.entries(pendingReleases());
@@ -1094,6 +1223,61 @@ function renderBoard(main) {
   main.append(h('div', { class:'grid even' }, ...shown.map(x => itemTile(x, items))));
 }
 
+// Newest order note, shown on Sourcing tiles so the admin sees what customer support added
+function latestNote(name) {
+  const n = ((S.notes || {})[name] || []).at(-1);
+  return n ? h('div', { class:'note', title: n.author_email }, `Note (${n.author_email.split('@')[0]}, ${when(n.created_at)}): ${n.body}`) : null;
+}
+// Customer update: a short message customer support can paste into an email or chat, one line per short-picked item
+function customerLine(line, st) {
+  const a = st.att;
+  switch (st.key) {
+    case 'hq_check': return 'we’re double-checking our warehouse for it.';
+    case 'new': case 'bad': return 'we’re sourcing it from one of our stores.';
+    case 'wait': return 'we’re confirming stock with one of our stores.';
+    case 'ok': return a.collect_mail_at || a.collection_ref
+      ? 'it’s packed at one of our stores and waiting for our courier, Aramex, to collect it.'
+      : 'one of our stores has it set aside, and it will be sent to you shortly.';
+    case 'hold': return 'we’re looking into it and will update you shortly.';
+    case 'sent': return a?.delivered_at ? 'Aramex has delivered it.'
+      : `it’s on its way to you with Aramex${hasWaybill(a) ? ` (waybill ${a.waybill_number})` : ''}, separately from the rest of your order.`;
+    case 'hq': return 'we found it at our warehouse and it will be sent from there.';
+    case 'refund': return line.shopify_current === 0 ? 'unfortunately it’s out of stock everywhere, so we’ve refunded it.'
+      : 'unfortunately it’s out of stock everywhere, so we’ll refund it.';
+    default: return 'it was cancelled.';
+  }
+}
+async function copyCustomerUpdate(name, lines, o) {
+  const first = String(o.customer_name || '').trim().split(/\s+/)[0];
+  const items = lines.filter(l => l.state !== 'cancelled');
+  const body = items.map(l => `${items.length > 1 ? '- ' : ''}${l.item_name}: ${customerLine(l, stageOf(l))}`).join('\n');
+  const text = `Hi${first ? ' ' + first : ''},\n\nThank you for your patience with order ${name}. ` +
+    `Here’s an update on ${items.length > 1 ? 'the items' : 'the item'} not in your first parcel:\n\n${body}\n\nKind regards,\nThe FOM team`;
+  await navigator.clipboard.writeText(text);
+  toast('Customer update copied');
+}
+// Notes on an order: anyone signed in can add one (the only thing customer support can write); the admin can delete
+function orderNotes(name) {
+  const notes = (S.notes || {})[name] || [];
+  const input = h('textarea', { class:'input', rows: 2, maxlength: 1000, placeholder:'Add a note, e.g. customer phoned 10 Oct, prefers a refund', 'aria-label':'Note for ' + name, style:'width:100%;resize:vertical' });
+  const add = h('button', { class:'btn sm', onclick: () => {
+    const body = input.value.trim();
+    if (!body) return;
+    act(async () => {
+      const r = await supa.from('ful_order_notes').insert({ order_name: name, body });
+      if (r.error) throw r.error;
+    }, 'Note added');
+  } }, 'Add note');
+  return h('div', { class:'sub notes' },
+    h('div', { class:'section-title' }, `Notes${notes.length ? ` (${notes.length})` : ''}`),
+    ...notes.map(n => h('div', { class:'order-note' },
+      h('div', { class:'xs muted' }, `${n.author_email.split('@')[0]} · ${when(n.created_at)}`,
+        isAdmin() ? h('button', { class:'link-btn', 'aria-label':'Delete note', onclick: () => { if (confirm('Delete this note?')) act(async () => {
+          const r = await supa.from('ful_order_notes').delete().eq('id', n.id); if (r.error) throw r.error; }, 'Note deleted'); } }, 'Delete') : null),
+      h('div', { class:'sm' }, n.body))),
+    input, h('div', null, add));
+}
+
 function renderLookup(main) {
   main.append(h('div', { class:'page-head' }, h('div', null, h('div', { class:'page-title' }, 'Order lookup'),
     h('div', { class:'page-sub' }, 'Search an online order to see where each short-picked item is coming from, store stock, and which emails have gone out.'))));
@@ -1141,6 +1325,7 @@ function renderLookup(main) {
           if (a.stock_mail_at) tl.push([a.stock_mail_at, `Stock check email sent to ${short(a.location_name)}`]);
           if (a.followup_mail_at) tl.push([a.followup_mail_at, `Follow-up email sent to ${short(a.location_name)}`]);
           if (a.replied_at) tl.push([a.replied_at, `${short(a.location_name)} replied` + (['ok','bad','hold'].includes(a.status) ? `: ${STATUS_LABEL[a.status]}` : a.status === 'sent' ? ': Has stock' : '')]);
+          if (a.status === 'noreply') tl.push([a.updated_at || a.created_at, `No reply from ${short(a.location_name)} – asked another store`]);
           if (a.release_mail_at) tl.push([a.release_mail_at, `“No longer needed” email sent to ${short(a.location_name)}`]);
           if (hasWaybill(a)) tl.push([a.waybill_created_at, `Aramex waybill ${a.waybill_number} created${a.collection_ref ? ` – collection booked for ${a.collection_date} (ref ${a.collection_ref})` : ''}`]);
           if (a.collect_mail_at) tl.push([a.collect_mail_at, `Collection email sent to ${short(a.location_name)}`]);
@@ -1160,6 +1345,8 @@ function renderLookup(main) {
             h('details', { class:'history' }, h('summary', null, 'History'),
               h('ul', { class:'timeline' }, ...tl.map(([t, txt]) => h('li', null, h('time', null, when(t)), txt)))))));
       });
+      card.append(orderNotes(name), h('div', { class:'card-actions' },
+        h('button', { class:'btn outline sm', onclick: () => copyCustomerUpdate(name, lines, o) }, 'Copy customer update')));
       res.append(card);
     }
   }
@@ -1203,6 +1390,84 @@ function renderRefunds(main) {
   main.append(h('div', { class:'card', style:'overflow-x:auto' }, tbl));
 }
 
+// ---------- reports (admin) ----------
+const median = xs => { const s = xs.filter(x => x != null && isFinite(x)).sort((a, b) => a - b); return s.length ? (s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2) : null; };
+const hoursBetween = (a, b) => a && b ? (new Date(b) - new Date(a)) / 36e5 : null;
+const hText = x => x == null ? '–' : x < 1 ? `${Math.max(1, Math.round(x * 60))} min` : x < 48 ? `${x.toFixed(x < 10 ? 1 : 0)} h` : `${(x / 24).toFixed(1)} days`;
+const pct = (n, d) => d ? `${Math.round(100 * n / d)}%` : '–';
+function mondayOf(iso) { const d = new Date(iso); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return d; }
+
+function storeReport() {
+  const by = {};
+  for (const a of S.attempts) {
+    if (a.status === 'released') continue;
+    const r = by[a.location_name] ||= { loc: a.location_name, asked: 0, hadIt: 0, noStock: 0, noReply: 0, waiting: 0, reply: [], collect: [] };
+    r.asked++;
+    if (['ok','sent'].includes(a.status)) r.hadIt++;
+    else if (a.status === 'bad') r.noStock++;
+    else if (a.status === 'noreply') r.noReply++;
+    else if (a.status === 'wait') r.waiting++;
+    if (a.stock_mail_at && a.replied_at) r.reply.push(hoursBetween(a.stock_mail_at, a.replied_at));
+    if (a.collect_mail_at && a.collected_at) r.collect.push(hoursBetween(a.collect_mail_at, a.collected_at));
+  }
+  return Object.values(by).sort((a, b) => b.asked - a.asked || short(a.loc).localeCompare(short(b.loc)));
+}
+function weeklyReport(weeks = 6) {   // 6 weeks fits the 45 days of short picks the app loads
+  const start = mondayOf(new Date(Date.now() - (weeks - 1) * 7 * 864e5));
+  const rows = Array.from({ length: weeks }, (_, i) => { const d = new Date(start); d.setDate(d.getDate() + i * 7);
+    return { week: d, added: 0, hq: 0, stores: 0, refund: 0, open: 0, days: [] }; }).reverse();
+  for (const l of S.lines) {
+    const w = rows.find(r => new Date(l.added_at) >= r.week); if (!w) continue;
+    w.added++;
+    const st = stageOf(l);
+    if (st.key === 'hq') w.hq++;
+    else if (st.key === 'refund') w.refund++;
+    else if (st.key === 'sent') { w.stores++; w.days.push(hoursBetween(l.added_at, st.att.collected_at) / 24); }
+    else if (isOpenStage(st.key)) w.open++;
+  }
+  return rows;
+}
+function renderReports(main) {
+  main.append(h('div', { class:'page-head' }, h('div', null, h('div', { class:'page-title' }, 'Reports'),
+    h('div', { class:'page-sub' }, `From the last ${CONFIG.LOOKBACK_DAYS} days of short picks. Times are medians: half the stores or items were faster.`))));
+
+  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Weekly numbers'),
+    h('p', { class:'muted sm' }, 'Short-picked items by the week they were added, and where they ended up.'))));
+  const wt = h('table', { class:'plain' }, h('tr', null, ...['Week of','Short picks','Found at HQ','Sent from stores','Refunded','Still open','Short pick → collected'].map(t => h('th', null, t))));
+  for (const r of weeklyReport()) wt.append(h('tr', null,
+    h('td', { class:'mono' }, r.week.toLocaleDateString('en-ZA', { day:'numeric', month:'short' })),
+    h('td', { class:'mono' }, String(r.added)),
+    h('td', { class:'mono' }, `${r.hq} (${pct(r.hq, r.added)})`), h('td', { class:'mono' }, `${r.stores} (${pct(r.stores, r.added)})`),
+    h('td', { class:'mono' }, `${r.refund} (${pct(r.refund, r.added)})`), h('td', { class:'mono' }, String(r.open)),
+    h('td', { class:'mono' }, median(r.days) == null ? '–' : `${median(r.days).toFixed(1)} days`)));
+  main.append(h('div', { class:'card', style:'overflow-x:auto' }, wt));
+
+  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Stores'),
+    h('p', { class:'muted sm' }, 'How each store handles stock checks. Every store was asked because Shopify showed stock, so “No stock” means the store’s stock count was wrong.'))));
+  const rep = storeReport();
+  if (!rep.length) { main.append(h('div', { class:'empty' }, 'No store requests yet.')); return; }
+  const tt = h('table', { class:'plain' }, h('tr', null, ...['Store','Asked','Had it','No stock','No reply','Waiting now','Reply time','Collection time'].map(t => h('th', null, t))));
+  for (const r of rep) tt.append(h('tr', null,
+    h('td', null, short(r.loc)), h('td', { class:'mono' }, String(r.asked)),
+    h('td', { class:'mono' }, `${r.hadIt} (${pct(r.hadIt, r.asked)})`),
+    h('td', { class:'mono', style: r.noStock && r.noStock / r.asked >= .3 ? 'color:var(--warn)' : null }, `${r.noStock} (${pct(r.noStock, r.asked)})`),
+    h('td', { class:'mono', style: r.noReply ? 'color:var(--warn)' : null }, String(r.noReply)),
+    h('td', { class:'mono' }, String(r.waiting)),
+    h('td', { class:'mono' }, hText(median(r.reply))), h('td', { class:'mono' }, hText(median(r.collect)))));
+  main.append(h('div', { class:'card', style:'overflow-x:auto' }, tt));
+}
+
+// HQ stock adjustments as a CSV for the stock team (opens in Excel)
+function downloadAdjustmentsCsv(onlyOpen) {
+  const rows = S.adjustments.filter(a => !onlyOpen || !a.resolved_at);
+  const cell = v => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  const csv = [['Reported','SKU','Item','Order','HQ showed','Status'], ...rows.map(a => [
+    new Date(a.reported_at).toLocaleString('en-ZA'), '="' + a.sku + '"', a.item_name, a.order_name, a.hq_available, a.resolved_at ? 'Adjusted ' + new Date(a.resolved_at).toLocaleDateString('en-ZA') : 'To adjust'])]
+    .map(r => r.map(cell).join(',')).join('\r\n');
+  const a = h('a', { href: URL.createObjectURL(new Blob(['﻿' + csv], { type:'text/csv' })), download: `HQ stock adjustments ${new Date().toLocaleDateString('en-CA')}.csv` });
+  document.body.append(a); a.click(); a.remove();
+}
+
 function renderAdjust(main) {
   main.append(h('div', { class:'page-head' }, h('div', null, h('div', { class:'page-title' }, 'HQ stock adjustments'),
     h('div', { class:'page-sub' }, 'What the warehouse recheck turned up: SKUs HQ’s system shows but nobody could find, and short picks that were at HQ after all.'))));
@@ -1222,7 +1487,10 @@ function renderAdjust(main) {
   }
 
   main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Not found – adjust stock', h('span', { class:'count' }, S.adjustments.filter(a => !a.resolved_at).length)),
-    h('p', { class:'muted sm' }, 'HQ’s system showed stock but the warehouse couldn’t find it. These need a stock adjustment.'))));
+    h('p', { class:'muted sm' }, 'HQ’s system showed stock but the warehouse couldn’t find it. These need a stock adjustment.')),
+    S.adjustments.length ? h('div', { class:'actions' },
+      h('button', { class:'btn sm', onclick: () => downloadAdjustmentsCsv(true) }, 'Download to adjust (CSV)'),
+      h('button', { class:'btn ghost sm', onclick: () => downloadAdjustmentsCsv(false) }, 'Download all')) : null));
   if (!S.adjustments.length) { main.append(h('div', { class:'empty' }, 'Nothing logged yet.')); return; }
   const tbl = h('table', { class:'plain' }, h('tr', null, ...['Reported','SKU','Item','Order','HQ showed','Status',''].map(t => h('th', null, t))));
   for (const a of S.adjustments) tbl.append(h('tr', null,
@@ -1291,6 +1559,7 @@ function render() {
   main.textContent = '';
   if (S.view === 'lookup') renderLookup(main);
   else if (S.view === 'refunds') renderRefunds(main);
+  else if (S.view === 'reports' && isAdmin()) renderReports(main);
   else if (S.view === 'adjust' && isAdmin()) renderAdjust(main);
   else if (S.view === 'stores' && isAdmin()) renderStores(main);
   else renderBoard(main);
@@ -1365,7 +1634,7 @@ document.getElementById('changePw').addEventListener('click', openChangePassword
 supa.auth.getSession().then(({ data }) => start(data.session));
 // Keep the board fresh while it's open
 setInterval(() => {
-  const busy = document.getElementById('modalRoot').children.length || S.view === 'stores' || document.activeElement?.id === 'q';
+  const busy = document.getElementById('modalRoot').children.length || S.view === 'stores' || ['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName) || [...document.querySelectorAll('textarea')].some(t => t.value.trim());
   if (S.role && document.visibilityState === 'visible' && !busy) act(async () => {});
 }, 60000);
 </script>
