@@ -100,7 +100,7 @@ function stageOf(line) {
 function sayFor(line, st) {
   const s = st.att ? short(st.att.location_name) : '';
   switch (st.key) {
-    case 'refund': return 'No store can supply this item. It will be refunded.';
+    case 'refund': return line.shopify_current === 0 ? 'No store could supply this item. It has been refunded in Shopify.' : 'No store can supply this item. It will be refunded.';
     case 'cancelled': return 'Item cancelled.';
     case 'hq': return 'The warehouse found it. It ships from HQ.';
     case 'hq_check': return `The warehouse system shows ${avail(line.sku, hqLoc())} at HQ. The warehouse is checking again.`;
@@ -823,11 +823,13 @@ function openAddShortPick() {
 function renderTabs() {
   const openCount = S.lines.filter(l => isOpenStage(stageOf(l).key)).length;
   const adjOpen = S.adjustments.filter(a => !a.resolved_at).length;
+  const toRefund = refundLines().filter(l => !isRefunded(l)).length;
+  // Customer support sees the refund sheet; HQ stock adjustments and stores are the admin's only.
   const tabs = [
     ['board', 'Sourcing', openCount],
     ['lookup', 'Order lookup'],
-    ['adjust', 'HQ stock adjustments', adjOpen],
-    ...(isAdmin() ? [['stores', 'Stores']] : []),
+    ['refunds', 'Refunds', toRefund],
+    ...(isAdmin() ? [['adjust', 'HQ stock adjustments', adjOpen], ['stores', 'Stores']] : []),
   ];
   document.getElementById('tabs').replaceChildren(...tabs.map(([k, label, n]) =>
     h('button', { class:'tab', role:'tab', 'aria-selected': String(S.view === k), onclick: () => { S.view = k; render(); } }, label, n ? h('span', { class:'n' }, n) : null)));
@@ -1165,6 +1167,42 @@ function renderLookup(main) {
   if (S.focusSearch) { input.focus(); S.focusSearch = false; }
 }
 
+// Refund sheet: items no store could supply, marked for refund. "Refunded" comes from Shopify (the item's current
+// quantity drops to 0 once it's refunded there), picked up by the 20-minute sync.
+const refundLines = () => S.lines.filter(l => l.state === 'refund');
+const isRefunded = l => l.shopify_current === 0;
+function refundMarkedAt(l) {
+  const ev = S.events.filter(e => e.line_id === l.id && e.kind === 'refund').map(e => e.at).sort().pop();
+  return ev || l.updated_at || l.added_at;
+}
+function renderRefunds(main) {
+  main.append(h('div', { class:'page-head' }, h('div', null, h('div', { class:'page-title' }, 'Refunds'),
+    h('div', { class:'page-sub' }, 'Short-picked items no store could supply. Refund them in Shopify – the sheet shows “Refunded” once Shopify has the refund (it checks every 20 minutes).'))));
+  const all = refundLines();
+  const done = all.filter(isRefunded).length;
+  const filter = S.refundFilter || 'todo';
+  main.append(h('div', { class:'cats' },
+    ...[['todo', 'To refund', all.length - done], ['done', 'Refunded', done], ['all', 'All', all.length]].map(([k, label, n]) =>
+      h('button', { class:'cat' + (n ? '' : ' empty-cat'), role:'tab', 'aria-selected': String(filter === k), onclick: () => { S.refundFilter = k; render(); } },
+        h('span', { class:'cat-v' }, String(n)), h('span', { class:'cat-t' }, label)))));
+  const rows = all.filter(l => filter === 'all' || (filter === 'done') === isRefunded(l))
+    .sort((a, b) => String(refundMarkedAt(b)).localeCompare(String(refundMarkedAt(a))));
+  if (!rows.length) { main.append(h('div', { class:'empty' }, filter === 'todo' ? 'Nothing waiting for a refund.' : 'Nothing here.')); return; }
+  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Marked','Order','Customer','SKU','Item','Qty','Note','Status'].map(t => h('th', null, t))));
+  for (const l of rows) {
+    const o = S.orders[l.order_name] || {};
+    const fin = o.financial_status ? o.financial_status.toLowerCase().replace(/_/g, ' ') : '';
+    tbl.append(h('tr', null,
+      h('td', { class:'mono' }, when(refundMarkedAt(l))),
+      h('td', { class:'mono' }, h('a', { href:'#' + l.order_name, onclick: e => { e.preventDefault(); S.view = 'lookup'; S.query = l.order_name; render(); } }, l.order_name)),
+      h('td', null, o.customer_name || ''), h('td', { class:'mono' }, l.sku), h('td', null, l.item_name || ''), h('td', { class:'mono' }, String(l.qty)),
+      h('td', null, l.note || ''),
+      h('td', null, isRefunded(l) ? h('span', { class:'badge b-sent', title: fin ? 'Shopify: ' + fin : null }, 'Refunded')
+        : h('span', { class:'badge b-wait', title: fin ? 'Shopify: ' + fin : null }, 'To refund'))));
+  }
+  main.append(h('div', { class:'card', style:'overflow-x:auto' }, tbl));
+}
+
 function renderAdjust(main) {
   main.append(h('div', { class:'page-head' }, h('div', null, h('div', { class:'page-title' }, 'HQ stock adjustments'),
     h('div', { class:'page-sub' }, 'What the warehouse recheck turned up: SKUs HQ’s system shows but nobody could find, and short picks that were at HQ after all.'))));
@@ -1252,7 +1290,8 @@ function render() {
   const hadFocus = document.activeElement?.id === 'q';
   main.textContent = '';
   if (S.view === 'lookup') renderLookup(main);
-  else if (S.view === 'adjust') renderAdjust(main);
+  else if (S.view === 'refunds') renderRefunds(main);
+  else if (S.view === 'adjust' && isAdmin()) renderAdjust(main);
   else if (S.view === 'stores' && isAdmin()) renderStores(main);
   else renderBoard(main);
   if (hadFocus) { const q = document.getElementById('q'); if (q) { q.focus(); q.setSelectionRange(q.value.length, q.value.length); } }
