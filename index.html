@@ -174,12 +174,12 @@ async function loadAll() {
     supa.from('ful_hq_adjustments').select('*').order('reported_at', { ascending:false }).limit(500),
     supa.from('ful_sync_log').select('*').order('at', { ascending:false }).limit(1),
     supa.from('ful_mail_log').select('*').eq('outcome', 'flagged').is('reviewed_at', null).order('received_at', { ascending:false }).limit(50),
-    supa.from('ful_mail_log').select('scanned_at').order('scanned_at', { ascending:false }).limit(1),
+    supa.from('ful_scan_runs').select('at,checked,applied,flagged').order('at', { ascending:false }).limit(1),
   ]);
   for (const r of [loc, lines, adj, sync, flags, scan]) if (r.error) throw r.error;
   S.lastSync = sync.data[0] || null;
   S.mailFlags = flags.data;
-  S.lastScan = scan.data[0]?.scanned_at || null;
+  S.lastScan = scan.data[0] || null;
   S.locations = loc.data; S.locByName = Object.fromEntries(loc.data.map(l => [l.name, l]));
   S.lines = lines.data; S.adjustments = adj.data;
   const ids = S.lines.map(l => l.id);
@@ -1175,7 +1175,17 @@ function renderBoard(main) {
       ? `Shopify data last updated ${when(S.lastSync.at)} (${S.lastSync.trigger === 'auto' ? 'automatic' : 'manual'} sync). Updates every 20 minutes, 07:00–18:40 Mon–Sat.`
       : `Last Shopify sync failed at ${when(S.lastSync.at)}: ${S.lastSync.detail || 'unknown error'}`));
 
-  if (S.lastScan) main.append(h('div', { class:'dim sm', style:'margin-top:-14px' }, `Email scan last ran ${when(S.lastScan)}. Store confirmations update the board automatically, hourly.`));
+  // Email scan: when it really last ran (every run records itself). It runs on the admin's PC, hourly Mon–Sat
+  // 07:00–18:59, so more than 90 minutes without a run inside those hours means it has stopped.
+  // (checked from 08:00, so the day's first run at about 07:05 has had time to happen)
+  const now = new Date(), workHours = now.getDay() !== 0 && now.getHours() >= 8 && now.getHours() < 20;
+  const scanLate = workHours && (!S.lastScan || ageHours(S.lastScan.at) > 1.5);
+  const scanText = S.lastScan
+    ? `Email scan last ran ${when(S.lastScan.at)}${S.lastScan.checked ? ` (${S.lastScan.checked} new email${S.lastScan.checked === 1 ? '' : 's'}${S.lastScan.applied ? `, ${S.lastScan.applied} applied` : ''})` : ' (no new emails)'}.`
+    : 'The email scan hasn’t run yet.';
+  main.append(scanLate
+    ? h('div', { class:'banner', style:'margin-top:-6px' }, `${scanText} It should run every hour – it runs on ${nameOf(ADMIN_EMAIL)}’s computer, so check the PC is on and the Claude app is open.`)
+    : h('div', { class:'dim sm', style:'margin-top:-14px' }, `${scanText} Store confirmations update the board automatically, hourly.`));
 
   if (isAdmin()) renderToday(main, items);
 
