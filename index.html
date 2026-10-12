@@ -1592,7 +1592,7 @@ async function start(session) {
   const hash = decodeURIComponent(location.hash.slice(1));
   if (hash) { S.view = 'lookup'; S.query = hash; }
   document.getElementById('whoEmail').textContent = S.email;
-  document.getElementById('whoRole').textContent = role === 'admin' ? 'Admin' : 'Read only';
+  document.getElementById('whoRole').textContent = role === 'admin' ? 'Admin' : 'Customer support';
   document.getElementById('loginView').hidden = true; document.getElementById('appView').hidden = false;
   try { await loadAll(); } catch (e) { console.error(e); toast('Couldn’t load: ' + e.message); }
   render();
