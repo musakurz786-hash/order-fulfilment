@@ -274,3 +274,4 @@ table.plain .input{padding:7px 12px}
 .link-btn{background:none;border:0;padding:0 0 0 8px;color:var(--text-2);font:inherit;font-size:12px;text-decoration:underline;cursor:pointer}
 .card-actions{display:flex;gap:8px;flex-wrap:wrap;padding-top:4px}
 .today .flag-main .item-name{font-size:14px}
+.banner a{color:inherit;font-weight:600}
