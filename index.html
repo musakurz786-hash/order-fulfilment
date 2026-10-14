@@ -1476,13 +1476,17 @@ function renderTracker(main) {
       h('div', { class:'page-sub' }, `Every online order against the 2-working-day SLA (Mon–Sat, Sundays don’t count). An order is out when its first parcel is manifested in Shopify. Target: ${SLA_TARGET}% of each day’s orders out in time.`)),
     h('div', { class:'page-actions' }, h('button', { class:'btn', onclick: async e => {
       e.target.disabled = true; e.target.textContent = 'Pulling…';
-      try { await callSync({ sla: true }); await loadAll(); toast('Orders updated'); }
+      try {
+        const r = await callSync({ sla: true });
+        await loadAll();
+        toast((r.warnings || []).length ? r.warnings.join(' ') : 'Orders updated');
+      }
       catch (err) { toast('Pull failed: ' + err.message); }
       render();
     } }, 'Pull orders now'))));
   const all = slaOrders();
   if (!all.length) { main.append(h('div', { class:'empty' }, 'No orders pulled yet — click “Pull orders now”.')); return; }
-  main.append(h('div', { class:'dim sm' }, `Orders last pulled ${when(all.map(o => o.synced_at).sort().pop())}. Pulled automatically at 07:00, 11:00, 15:00 and 18:00, Mon–Sat.`));
+  main.append(h('div', { class:'dim sm' }, `Orders last pulled ${when(all.map(o => o.synced_at).sort().pop())}. Pulled automatically at 07:10, 11:10, 15:10 and 18:10, Mon–Sat.`));
 
   const withSt = all.map(o => ({ o, st: slaStatus(o), day: slaDayKey(o.created_at) }));
   const monthKey = slaDayKey(new Date().toISOString()).slice(0, 7);
@@ -1533,8 +1537,8 @@ function renderTracker(main) {
   const dueCell = x => {
     const due = slaDueEnd(x.o.created_at);
     if (x.st === 'overdue') return h('span', { class:'badge b-bad' }, `Overdue ${ageText(due.toISOString())}`);
-    const hrs = (due.getTime() - Date.now()) / 36e5;
-    return hrs <= 26 ? h('span', { class:'badge b-wait' }, 'Due today')
+    return slaDayKey(due.toISOString()) === slaDayKey(new Date().toISOString())
+      ? h('span', { class:'badge b-wait' }, 'Due today')
       : h('span', { class:'badge' }, 'Due ' + due.toLocaleDateString('en-ZA', { weekday:'short', day:'numeric', month:'short' }));
   };
   const bt = h('table', { class:'plain' }, h('tr', null, ...['SLA','Order','Customer','Placed','Shopify'].map(t => h('th', null, t))));
