@@ -108,7 +108,7 @@ function stageOf(line) {
 function sayFor(line, st) {
   const s = st.att ? short(st.att.location_name) : '';
   switch (st.key) {
-    case 'refund': return line.shopify_current === 0 ? 'No store could supply this item. It has been refunded in Shopify.' : 'No store can supply this item. It will be refunded.';
+    case 'refund': return isRefunded(line) ? 'No store could supply this item. It has been refunded in Shopify.' : 'No store can supply this item. It will be refunded.';
     case 'cancelled': return 'Item cancelled.';
     case 'hq': return 'The warehouse found it. It ships from HQ.';
     case 'hq_check': return `The warehouse system shows ${avail(line.sku, hqLoc())} at HQ. The warehouse is checking again.`;
@@ -1269,7 +1269,7 @@ function customerLine(line, st) {
     case 'sent': return a?.delivered_at ? 'Aramex has delivered it.'
       : `it’s on its way to you with Aramex${hasWaybill(a) ? ` (waybill ${a.waybill_number})` : ''}, separately from the rest of your order.`;
     case 'hq': return 'we found it at our warehouse and it will be sent from there.';
-    case 'refund': return line.shopify_current === 0 ? 'unfortunately it’s out of stock everywhere, so we’ve refunded it.'
+    case 'refund': return isRefunded(line) ? 'unfortunately it’s out of stock everywhere, so we’ve refunded it.'
       : 'unfortunately it’s out of stock everywhere, so we’ll refund it.';
     default: return 'it was cancelled.';
   }
@@ -1366,7 +1366,7 @@ function renderLookup(main) {
           for (const t of a.aramex_events || []) if (t.at && !isNaN(new Date(t.at))) tl.push([new Date(t.at).toISOString(), `Aramex: ${t.text}${t.location ? ' (' + t.location + ')' : ''}`]);
         }
         for (const e of evs) if (['hq_found','hq_not_found','refund','email'].includes(e.kind)) tl.push([e.at,
-          e.kind === 'hq_found' ? 'Found at HQ' : e.kind === 'refund' ? 'Marked for refund' : e.kind === 'email' ? (e.detail || 'Updated from email') : 'Not found at HQ (' + (e.detail || '') + ')']);
+          e.kind === 'hq_found' ? 'Found at HQ' : e.kind === 'refund' ? (e.detail || 'Marked for refund') : e.kind === 'email' ? (e.detail || 'Updated from email') : 'Not found at HQ (' + (e.detail || '') + ')']);
         tl.sort((a, b) => String(a[0]).localeCompare(String(b[0])));
         card.append(h('div', { class:'sub' },
           itemBlock(line, st, {
@@ -1389,7 +1389,8 @@ function renderLookup(main) {
 // Refund sheet: items no store could supply, marked for refund. "Refunded" comes from Shopify (the item's current
 // quantity drops to 0 once it's refunded there), picked up by the 20-minute sync.
 const refundLines = () => S.lines.filter(l => l.state === 'refund');
-const isRefunded = l => l.shopify_current === 0;
+// Refunded: Shopify shows it (current quantity 0), or someone ticked it as done on the refund sheet
+const isRefunded = l => l.shopify_current === 0 || !!l.refund_done_at;
 function refundMarkedAt(l) {
   const ev = S.events.filter(e => e.line_id === l.id && e.kind === 'refund').map(e => e.at).sort().pop();
   return ev || l.updated_at || l.added_at;
@@ -1409,27 +1410,37 @@ function renderRefunds(main) {
   const todo = all.filter(l => !isRefunded(l)).sort((a, b) => String(refundMarkedAt(a)).localeCompare(String(refundMarkedAt(b))));
   main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'To be refunded', h('span', { class:'count' }, todo.length)),
     h('p', { class:'muted sm' }, todo.length ? 'Still to be processed in Shopify. Oldest first.' : 'Nothing waiting – every marked item has been refunded in Shopify.'))));
+  // Tick: records who processed the refund in Shopify (reversible with Untick until Shopify confirms it)
+  const setDone = (l, done) => act(async () => {
+    const { data, error } = await supa.rpc('ful_mark_refunded', { p_line_id: l.id, p_done: done });
+    if (error) throw error;
+    if (String(data).startsWith('error')) throw new Error(String(data).replace('error: ', ''));
+  }, done ? 'Ticked as refunded' : 'Unticked');
   if (todo.length) {
-    const t1 = h('table', { class:'plain' }, h('tr', null, ...['Waiting','Marked','Order','Customer','SKU','Item','Qty','Note'].map(t => h('th', null, t))));
+    const t1 = h('table', { class:'plain' }, h('tr', null, ...['Waiting','Marked','Order','Customer','SKU','Item','Qty','Note',''].map(t => h('th', null, t))));
     for (const [l, o, fin] of todo.map(row)) t1.append(h('tr', null,
       h('td', null, h('span', { class:'badge ' + (ageHours(refundMarkedAt(l)) >= 48 ? 'b-bad' : 'b-wait'), title: fin }, ageText(refundMarkedAt(l)))),
       h('td', { class:'mono' }, when(refundMarkedAt(l))), orderCell(l),
       h('td', null, o.customer_name || ''), h('td', { class:'mono' }, l.sku), h('td', null, l.item_name || ''), h('td', { class:'mono' }, String(l.qty)),
-      h('td', null, l.note || '')));
+      h('td', null, l.note || ''),
+      h('td', null, canEmail() ? h('button', { class:'btn primary sm', onclick: () => setDone(l, true) }, '✓ Refunded') : null)));
     main.append(h('div', { class:'card', style:'overflow-x:auto' }, t1));
   }
 
   // Has been refunded: newest first
-  const done = all.filter(isRefunded).sort((a, b) => String(b.refunded_at || '').localeCompare(String(a.refunded_at || '')));
+  const doneAt = l => l.refunded_at || l.refund_done_at || '';
+  const done = all.filter(isRefunded).sort((a, b) => String(doneAt(b)).localeCompare(String(doneAt(a))));
   main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Has been refunded', h('span', { class:'count' }, done.length)),
-    h('p', { class:'muted sm' }, `Done in Shopify, last ${CONFIG.LOOKBACK_DAYS} days.`))));
+    h('p', { class:'muted sm' }, `Done, last ${CONFIG.LOOKBACK_DAYS} days. “Shopify” means Shopify itself shows the refund; a name means that person ticked it off (Shopify usually confirms within 20 minutes).`))));
   if (!done.length) { main.append(h('div', { class:'empty' }, 'None yet.')); return; }
-  const t2 = h('table', { class:'plain' }, h('tr', null, ...['Refunded','Marked','Order','Customer','SKU','Item','Qty','Note'].map(t => h('th', null, t))));
+  const t2 = h('table', { class:'plain' }, h('tr', null, ...['Refunded','By','Marked','Order','Customer','SKU','Item','Qty','Note',''].map(t => h('th', null, t))));
   for (const [l, o, fin] of done.map(row)) t2.append(h('tr', null,
-    h('td', null, h('span', { class:'badge b-sent', title: fin }, l.refunded_at ? when(l.refunded_at) : 'Refunded')),
+    h('td', null, h('span', { class:'badge b-sent', title: fin }, doneAt(l) ? when(doneAt(l)) : 'Refunded')),
+    h('td', null, l.shopify_current === 0 ? 'Shopify' : nameOf(l.refund_done_by)),
     h('td', { class:'mono' }, when(refundMarkedAt(l))), orderCell(l),
     h('td', null, o.customer_name || ''), h('td', { class:'mono' }, l.sku), h('td', null, l.item_name || ''), h('td', { class:'mono' }, String(l.qty)),
-    h('td', null, l.note || '')));
+    h('td', null, l.note || ''),
+    h('td', null, canEmail() && l.shopify_current !== 0 ? h('button', { class:'btn ghost sm', title:'Ticked by mistake? Put it back on the to-be-refunded list', onclick: () => setDone(l, false) }, 'Untick') : null)));
   main.append(h('div', { class:'card', style:'overflow-x:auto' }, t2));
 }
 
