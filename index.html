@@ -1346,7 +1346,7 @@ function renderLookup(main) {
           h('span', { class:'badge b-' + worst }, isOpenStage(worst) ? 'In progress' : 'Done')),
         h('div', { class:'facts' },
           o.city ? fact('Ships to', [o.city, o.province_code].filter(Boolean).join(', ')) : null,
-          o.customer_email ? fact('Email', o.customer_email) : null,
+          o.customer_email ? h('div', { class:'fact' }, h('span', { class:'fact-l' }, 'Email'), h('span', { class:'fact-v lower' }, o.customer_email)) : null,
           o.fulfillment_status ? fact('Shopify', o.fulfillment_status.toLowerCase().replace(/_/g, ' ')) : null,
           o.financial_status ? fact('Payment', o.financial_status.toLowerCase().replace(/_/g, ' ')) : null,
           o.tracking_numbers?.length ? fact('Waybill', o.tracking_numbers.join(', ')) : null));
