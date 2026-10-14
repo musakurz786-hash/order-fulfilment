@@ -1470,6 +1470,124 @@ function slaStatus(o) {
   if (o.first_fulfilled_at) return new Date(o.first_fulfilled_at) <= due ? 'met' : 'late';
   return Date.now() > due.getTime() ? 'overdue' : 'open';
 }
+// Tracker charts: hand-rolled SVG on the app's dark tiles. Fills are a validated chart palette (the badge
+// colours are too light and too close for colour-blind readers); "missed" is also hatched so colour never
+// carries it alone. met green / missed red / open blue, in that fixed stack order.
+const VIZ = { met:'#199e70', miss:'#d03b3b', open:'#3987e5', grid:'#262626', axis:'#6b6b6b' };
+const sv = (tag, attrs, ...kids) => {
+  const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs || {})) { if (v == null) continue; k.startsWith('on') ? e.addEventListener(k.slice(2), v) : e.setAttribute(k, v); }
+  for (const k of kids.flat()) if (k != null) e.append(k.nodeType ? k : document.createTextNode(String(k)));
+  return e;
+};
+function vizTip() {
+  let t = document.getElementById('vizTip');
+  if (!t) { t = h('div', { class:'viz-tip', id:'vizTip' }); document.body.append(t); }
+  return t;
+}
+const tipShow = (e, text) => { const t = vizTip(); t.textContent = text; t.style.display = 'block'; tipMove(e); };
+const tipMove = e => { const t = vizTip(); t.style.left = Math.min(e.clientX + 14, innerWidth - 180) + 'px'; t.style.top = (e.clientY - 12) + 'px'; };
+const tipHide = () => { vizTip().style.display = 'none'; };
+const dayLabel = day => new Date(day + 'T12:00:00').toLocaleDateString('en-ZA', { weekday:'short', day:'numeric', month:'short' });
+
+// Bar with a rounded top (data end) and a square baseline
+const topRect = (x, y, w, hgt, fill, rounded, extra) => {
+  const r = rounded ? Math.min(4, w / 2, hgt) : 0;
+  return sv('path', { d:`M${x},${y + hgt} V${y + r} Q${x},${y} ${x + r},${y} H${x + w - r} Q${x + w},${y} ${x + w},${y + r} V${y + hgt} Z`, fill, ...(extra || {}) });
+};
+
+function slaCharts(daysAsc, openDay) {
+  const W = 560, H = 230, P = { l: 30, r: 8, t: 10, b: 24 };
+  const iw = W - P.l - P.r, ih = H - P.t - P.b;
+  const n = daysAsc.length;
+  const step = iw / n, bw = Math.max(6, Math.min(34, step - Math.max(2, step * .25)));
+  const yMax = Math.max(4, ...daysAsc.map(d => d.total));
+  const yTick = Math.max(1, Math.ceil(yMax / 4));
+  const yTop = yTick * 4 >= yMax ? yTick * 4 : yTick * 5;
+  const y = v => P.t + ih - (v / yTop) * ih;
+  const xc = i => P.l + step * i + step / 2;
+
+  // Chart 1: each day's orders, stacked by outcome (met + missed + open = placed)
+  const defs = sv('defs', null, sv('pattern', { id:'slaHatch', patternUnits:'userSpaceOnUse', width:'5', height:'5', patternTransform:'rotate(45)' },
+    sv('rect', { width:'5', height:'5', fill: VIZ.miss }), sv('line', { x1:'0', y1:'0', x2:'0', y2:'5', stroke:'rgba(10,10,10,.5)', 'stroke-width':'2' })));
+  const bars = sv('svg', { viewBox:`0 0 ${W} ${H}`, role:'img', 'aria-label':'Orders per day by outcome' }, defs);
+  for (let g = 0; g <= 4; g++) {
+    const gy = y(g * yTick);
+    bars.append(sv('line', { x1: P.l, x2: W - P.r, y1: gy, y2: gy, stroke: VIZ.grid, 'stroke-width': 1 }));
+    if (g) bars.append(sv('text', { x: P.l - 5, y: gy + 3, 'text-anchor':'end', 'font-size':'9', fill: VIZ.axis }, g * yTick));
+  }
+  daysAsc.forEach((d, i) => {
+    const x0 = xc(i) - bw / 2;
+    const tip = `${dayLabel(d.day)} — ${d.total} placed\nOut in SLA ${d.m} · Missed ${d.miss} · Open ${d.op}`;
+    const hover = { class:'bar', onmouseenter: e => tipShow(e, tip), onmousemove: tipMove, onmouseleave: tipHide, onclick: () => openDay(d.day) };
+    const segs = [[d.m, VIZ.met], [d.miss, 'url(#slaHatch)'], [d.op, VIZ.open]].filter(s => s[0] > 0);
+    let acc = 0;
+    segs.forEach(([v, fill], si) => {
+      const yTopSeg = y(acc + v), hgt = Math.max(1.5, y(acc) - y(acc + v) - (si < segs.length - 1 ? 2 : 0));
+      bars.append(si === segs.length - 1 ? topRect(x0, yTopSeg, bw, hgt, fill, true, hover)
+        : sv('rect', { x: x0, y: yTopSeg, width: bw, height: hgt, fill, ...hover }));
+      acc += v;
+    });
+    if (n <= 20 || i % 2 === 0) bars.append(sv('text', { x: xc(i), y: H - 8, 'text-anchor':'middle', 'font-size':'9', fill: VIZ.axis },
+      String(Number(d.day.slice(8)))));
+  });
+  const chip = (c, label, hatch) => h('span', null, h('i', { style:`background:${hatch ? 'repeating-linear-gradient(45deg,' + VIZ.miss + ' 0 3px, rgba(10,10,10,.5) 3px 5px)' : c}` }), label);
+  const c1 = h('div', { class:'chart' },
+    h('div', null, h('div', { class:'chart-title' }, 'Orders per day'), h('div', { class:'dim xs' }, 'Click a bar for that day’s orders.')),
+    h('div', { class:'legend' }, chip(VIZ.met, 'Out in SLA'), chip(VIZ.miss, 'Missed', true), chip(VIZ.open, 'Still open')),
+    bars);
+
+  // Chart 2: the day's SLA % (single series) against the 80% target
+  const pts = daysAsc.map((d, i) => ({ ...d, i })).filter(d => d.p != null);
+  const y2 = v => P.t + ih - (v / 100) * ih;
+  const line = sv('svg', { viewBox:`0 0 ${W} ${H}`, role:'img', 'aria-label':'SLA percentage per day' });
+  for (const g of [0, 25, 50, 75, 100]) {
+    line.append(sv('line', { x1: P.l, x2: W - P.r, y1: y2(g), y2: y2(g), stroke: VIZ.grid, 'stroke-width': 1 }));
+    line.append(sv('text', { x: P.l - 5, y: y2(g) + 3, 'text-anchor':'end', 'font-size':'9', fill: VIZ.axis }, g));
+  }
+  line.append(sv('line', { x1: P.l, x2: W - P.r, y1: y2(SLA_TARGET), y2: y2(SLA_TARGET), stroke: VIZ.axis, 'stroke-width': 1, 'stroke-dasharray':'5 4' }));
+  line.append(sv('text', { x: W - P.r, y: y2(SLA_TARGET) - 4, 'text-anchor':'end', 'font-size':'9', fill: VIZ.axis }, `Target ${SLA_TARGET}%`));
+  if (pts.length > 1) line.append(sv('polyline', { points: pts.map(d => `${xc(d.i)},${y2(d.p)}`).join(' '), fill:'none', stroke: VIZ.open, 'stroke-width': 2, 'stroke-linejoin':'round', 'stroke-linecap':'round' }));
+  pts.forEach((d, k) => {
+    const tip = `${dayLabel(d.day)} — ${d.p}%${d.op ? ' so far' : ''} (${d.m} of ${d.m + d.miss} decided)`;
+    line.append(sv('circle', { cx: xc(d.i), cy: y2(d.p), r: 3.5, fill: d.op ? 'var(--tile)' : VIZ.open, stroke: VIZ.open, 'stroke-width': 2 }));
+    line.append(sv('circle', { cx: xc(d.i), cy: y2(d.p), r: 10, fill:'transparent', class:'bar',
+      onmouseenter: e => tipShow(e, tip), onmousemove: tipMove, onmouseleave: tipHide, onclick: () => openDay(d.day) }));
+    if (k === pts.length - 1) line.append(sv('text', { x: xc(d.i), y: y2(d.p) - 8, 'text-anchor':'middle', 'font-size':'10', 'font-weight':'600', fill:'#fafafa' }, d.p + '%'));
+  });
+  daysAsc.forEach((d, i) => { if (n <= 20 || i % 2 === 0) line.append(sv('text', { x: xc(i), y: H - 8, 'text-anchor':'middle', 'font-size':'9', fill: VIZ.axis }, String(Number(d.day.slice(8))))); });
+  const c2 = h('div', { class:'chart' },
+    h('div', null, h('div', { class:'chart-title' }, 'Out within SLA, day by day (%)'), h('div', { class:'dim xs' }, 'Hollow points: some of that day’s orders are still open, so the % can change.')),
+    line);
+  return h('div', { class:'charts' }, c1, c2);
+}
+
+// Drill-down: one day's orders in full
+function openSlaDay(day, xs) {
+  closeModal();
+  const sorted = [...xs].sort((a, b) => String(a.o.created_at).localeCompare(String(b.o.created_at)));
+  const m = xs.filter(x => x.st === 'met').length, miss = xs.filter(x => x.st === 'late' || x.st === 'overdue').length, op = xs.filter(x => x.st === 'open').length;
+  const SLA_CELL = { met: ['b-sent', 'Out in time'], late: ['b-bad', 'Out late'], overdue: ['b-bad', 'Overdue'], open: ['b-wait', 'Open'] };
+  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Order','Customer','Placed','First parcel out','Took','SLA'].map(t => h('th', null, t))));
+  for (const x of sorted) {
+    const [cls, label] = SLA_CELL[x.st];
+    tbl.append(h('tr', null,
+      h('td', { class:'mono' }, h('a', { href:'#' + x.o.order_name, onclick: e => { e.preventDefault(); closeModal(); S.view = 'lookup'; S.query = x.o.order_name; render(); } }, x.o.order_name)),
+      h('td', { title: x.o.customer_email || null }, x.o.customer_name || ''),
+      h('td', { class:'mono' }, when(x.o.created_at)),
+      h('td', { class:'mono' }, x.o.first_fulfilled_at ? when(x.o.first_fulfilled_at) : '—'),
+      h('td', { class:'mono' }, x.o.first_fulfilled_at ? hText(hoursBetween(x.o.created_at, x.o.first_fulfilled_at)) : '—'),
+      h('td', null, h('span', { class:'badge ' + cls }, label))));
+  }
+  const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
+    h('div', { class:'modal wide-modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Orders for ' + dayLabel(day) },
+      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, dayLabel(day)),
+        h('span', { class:'muted' }, `${xs.length} order${xs.length === 1 ? '' : 's'} · ${m} out in SLA · ${miss} missed · ${op} open`),
+        h('button', { class:'btn sm ghost', style:'margin-left:auto', onclick: closeModal }, 'Close')),
+      h('div', { class:'modal-body' }, h('div', { class:'card', style:'overflow-x:auto' }, tbl))));
+  document.getElementById('modalRoot').append(bg);
+}
+
 function renderTracker(main) {
   main.append(h('div', { class:'page-head' },
     h('div', null, h('div', { class:'page-title' }, 'Tracker'),
@@ -1504,27 +1622,32 @@ function renderTracker(main) {
     tile(missed, 'Missed the SLA', 'this month'),
     tile(overdueAll ? `${openAll} · ${overdueAll}` : openAll, 'Not yet out', overdueAll ? 'open, in time · overdue' : 'all still inside 2 days', overdueAll ? ' late-cat' : '')));
 
-  // Day by day, newest first. A day's % is final only once every order's outcome is known.
+  // This month, day by day: the charts and the table work off the same numbers; click either for the day's orders
   const days = {};
   for (const x of month) (days[x.day] ||= []).push(x);
-  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Day by day', h('span', { class:'count' }, Object.keys(days).length)),
-    h('p', { class:'muted sm' }, 'Orders by the day they were placed. “Missed” means the first parcel went out late, or still hasn’t and the 2 days are up.'))));
-  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Day','Placed','Out in SLA','Missed','Open, in time','SLA %'].map(t => h('th', null, t))));
-  for (const day of Object.keys(days).sort().reverse()) {
+  const daysAsc = Object.keys(days).sort().map(day => {
     const xs = days[day];
     const m = xs.filter(x => x.st === 'met').length;
     const miss = xs.filter(x => x.st === 'late' || x.st === 'overdue').length;
     const op = xs.filter(x => x.st === 'open').length;
-    const p = m + miss ? Math.round(100 * m / (m + miss)) : null;
-    tbl.append(h('tr', null,
-      h('td', { class:'mono' }, new Date(day + 'T12:00:00').toLocaleDateString('en-ZA', { weekday:'short', day:'numeric', month:'short' })),
-      h('td', { class:'mono' }, String(xs.length)),
-      h('td', { class:'mono' }, String(m)),
-      h('td', { class:'mono', style: miss ? 'color:var(--warn)' : null }, String(miss)),
-      h('td', { class:'mono' }, String(op)),
-      h('td', null, p == null ? h('span', { class:'muted sm' }, 'all still open')
-        : h('span', { class:'badge ' + (p >= SLA_TARGET ? 'b-sent' : op ? 'b-wait' : 'b-bad'),
-            title: op ? `${op} order${op === 1 ? '' : 's'} still open – this can still improve` : 'Final' }, `${p}%${op ? ' so far' : ''}`))));
+    return { day, m, miss, op, total: xs.length, p: m + miss ? Math.round(100 * m / (m + miss)) : null };
+  });
+  const openDay = day => openSlaDay(day, days[day]);
+  if (daysAsc.length) main.append(slaCharts(daysAsc, openDay));
+
+  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Day by day', h('span', { class:'count' }, daysAsc.length)),
+    h('p', { class:'muted sm' }, 'Orders by the day they were placed. “Missed” means the first parcel went out late, or still hasn’t and the 2 days are up. Click a day for its orders.'))));
+  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Day','Placed','Out in SLA','Missed','Open, in time','SLA %'].map(t => h('th', null, t))));
+  for (const d of [...daysAsc].reverse()) {
+    tbl.append(h('tr', { class:'rowlink', onclick: () => openDay(d.day) },
+      h('td', { class:'mono' }, dayLabel(d.day)),
+      h('td', { class:'mono' }, String(d.total)),
+      h('td', { class:'mono' }, String(d.m)),
+      h('td', { class:'mono', style: d.miss ? 'color:var(--warn)' : null }, String(d.miss)),
+      h('td', { class:'mono' }, String(d.op)),
+      h('td', null, d.p == null ? h('span', { class:'muted sm' }, 'all still open')
+        : h('span', { class:'badge ' + (d.p >= SLA_TARGET ? 'b-sent' : d.op ? 'b-wait' : 'b-bad'),
+            title: d.op ? `${d.op} order${d.op === 1 ? '' : 's'} still open – this can still improve` : 'Final' }, `${d.p}%${d.op ? ' so far' : ''}`))));
   }
   main.append(h('div', { class:'card', style:'overflow-x:auto' }, tbl));
 
