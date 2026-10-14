@@ -275,3 +275,4 @@ table.plain .input{padding:7px 12px}
 .card-actions{display:flex;gap:8px;flex-wrap:wrap;padding-top:4px}
 .today .flag-main .item-name{font-size:14px}
 .banner a{color:inherit;font-weight:600}
+.late-cat{border-color:rgba(248,113,113,.5)}
