@@ -1129,6 +1129,12 @@ function todayRows(items) {
   }
   const hold = items.filter(y => y.cat === 'hold');
   if (hold.length) rows.push({ rank: 6, title: `${hold.length} item${hold.length === 1 ? '' : 's'} on hold`, meta: itemsText(hold), btn: ['Open', goTo('hold')] });
+  // Items marked for refund but not yet refunded in Shopify (they're off the board, so counted from the lines)
+  const toRefund = refundLines().filter(l => !isRefunded(l)).sort((a, b) => String(refundMarkedAt(a)).localeCompare(String(refundMarkedAt(b))));
+  if (toRefund.length) rows.push({ rank: 7,
+    title: `${toRefund.length} item${toRefund.length === 1 ? '' : 's'} to be refunded in Shopify (oldest waiting ${ageText(refundMarkedAt(toRefund[0]))})`,
+    meta: toRefund.map(l => `${l.order_name} · ${l.item_name}`).join(' | '),
+    btn: ['Open refund sheet', () => { S.view = 'refunds'; render(); }] });
   return rows.sort((a, b) => a.rank - b.rank);
 }
 function renderToday(main, items) {
