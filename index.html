@@ -1365,8 +1365,8 @@ function renderLookup(main) {
           if (a.collected_at) tl.push([a.collected_at, `Collected from ${short(a.location_name)}`]);
           for (const t of a.aramex_events || []) if (t.at && !isNaN(new Date(t.at))) tl.push([new Date(t.at).toISOString(), `Aramex: ${t.text}${t.location ? ' (' + t.location + ')' : ''}`]);
         }
-        for (const e of evs) if (['hq_found','hq_not_found','refund','email'].includes(e.kind)) tl.push([e.at,
-          e.kind === 'hq_found' ? 'Found at HQ' : e.kind === 'refund' ? (e.detail || 'Marked for refund') : e.kind === 'email' ? (e.detail || 'Updated from email') : 'Not found at HQ (' + (e.detail || '') + ')']);
+        for (const e of evs) if (['hq_found','hq_not_found','refund','refund_tick','email'].includes(e.kind)) tl.push([e.at,
+          e.kind === 'hq_found' ? 'Found at HQ' : e.kind === 'refund' ? (e.detail || 'Marked for refund') : e.kind === 'refund_tick' ? (e.detail || 'Refund ticked off') : e.kind === 'email' ? (e.detail || 'Updated from email') : 'Not found at HQ (' + (e.detail || '') + ')']);
         tl.sort((a, b) => String(a[0]).localeCompare(String(b[0])));
         card.append(h('div', { class:'sub' },
           itemBlock(line, st, {
@@ -1411,11 +1411,14 @@ function renderRefunds(main) {
   main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'To be refunded', h('span', { class:'count' }, todo.length)),
     h('p', { class:'muted sm' }, todo.length ? 'Still to be processed in Shopify. Oldest first.' : 'Nothing waiting – every marked item has been refunded in Shopify.'))));
   // Tick: records who processed the refund in Shopify (reversible with Untick until Shopify confirms it)
-  const setDone = (l, done) => act(async () => {
+  const setDone = async (l, done) => {
     const { data, error } = await supa.rpc('ful_mark_refunded', { p_line_id: l.id, p_done: done });
-    if (error) throw error;
-    if (String(data).startsWith('error')) throw new Error(String(data).replace('error: ', ''));
-  }, done ? 'Ticked as refunded' : 'Unticked');
+    // Reload even when refused — a refusal usually means the row changed (e.g. Shopify confirmed it meanwhile)
+    try { await loadAll(); } catch (e) { console.error(e); }
+    render();
+    if (error || String(data).startsWith('error')) toast('Didn’t save: ' + (error?.message || String(data).replace('error: ', '')));
+    else toast(done ? 'Ticked as refunded' : 'Unticked');
+  };
   if (todo.length) {
     const t1 = h('table', { class:'plain' }, h('tr', null, ...['Waiting','Marked','Order','Customer','SKU','Item','Qty','Note',''].map(t => h('th', null, t))));
     for (const [l, o, fin] of todo.map(row)) t1.append(h('tr', null,
