@@ -1818,7 +1818,7 @@ function renderReports(main) {
 }
 
 // Why an item is on the adjustment sheet
-const ADJ_WHY = { not_found:'Not found at HQ', refund:'Refunded – no stock anywhere' };
+const ADJ_WHY = { not_found:'Not found at HQ', refund:'Refunded – HQ still shows stock' };
 // HQ stock adjustments as a CSV for the stock team (opens in Excel)
 function downloadAdjustmentsCsv(onlyOpen) {
   const rows = S.adjustments.filter(a => !onlyOpen || !a.resolved_at);
@@ -1849,7 +1849,7 @@ function renderAdjust(main) {
   }
 
   main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Adjust HQ stock', h('span', { class:'count' }, S.adjustments.filter(a => !a.resolved_at).length)),
-    h('p', { class:'muted sm' }, 'HQ couldn’t find these, so HQ’s system count needs adjusting down: items the warehouse recheck couldn’t find, and every item refunded because no store had it either. Check “HQ showed” – where it is already 0, HQ’s system is right and there is nothing to adjust.')),
+    h('p', { class:'muted sm' }, 'HQ couldn’t find these, so HQ’s system count needs adjusting down: items the warehouse recheck couldn’t find, and refunded items (no store had it either) where HQ’s system still shows 2 or more units. “HQ showed” follows the live count; a refund flag closes by itself once HQ drops below 2.')),
     S.adjustments.length ? h('div', { class:'actions' },
       h('button', { class:'btn sm', onclick: () => downloadAdjustmentsCsv(true) }, 'Download to adjust (CSV)'),
       h('button', { class:'btn ghost sm', onclick: () => downloadAdjustmentsCsv(false) }, 'Download all')) : null));
