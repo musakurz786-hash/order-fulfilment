@@ -168,20 +168,18 @@ function suggestStores(line, limit = 4) {
 // ---------- data ----------
 async function loadAll() {
   const since = new Date(Date.now() - CONFIG.LOOKBACK_DAYS * 864e5).toISOString();
-  const [loc, lines, adj, sync, flags, scan, sla] = await Promise.all([
+  const [loc, lines, adj, sync, flags, scan] = await Promise.all([
     supa.from('ful_locations').select('*').order('sort').order('name'),
     supa.from('ful_lines').select('*').gte('added_at', since).order('added_at', { ascending:false }).limit(2000),
     supa.from('ful_hq_adjustments').select('*').order('reported_at', { ascending:false }).limit(500),
     supa.from('ful_sync_log').select('*').order('at', { ascending:false }).limit(1),
     supa.from('ful_mail_log').select('*').eq('outcome', 'flagged').is('reviewed_at', null).order('received_at', { ascending:false }).limit(50),
     supa.from('ful_scan_runs').select('at,checked,applied,flagged').order('at', { ascending:false }).limit(1),
-    supa.from('ful_sla_orders').select('*').order('created_at', { ascending:false }).limit(6000),   // admin only (RLS gives others 0 rows)
   ]);
-  for (const r of [loc, lines, adj, sync, flags, scan, sla]) if (r.error) throw r.error;
+  for (const r of [loc, lines, adj, sync, flags, scan]) if (r.error) throw r.error;
   S.lastSync = sync.data[0] || null;
   S.mailFlags = flags.data;
   S.lastScan = scan.data[0] || null;
-  S.sla = sla.data;
   S.locations = loc.data; S.locByName = Object.fromEntries(loc.data.map(l => [l.name, l]));
   S.lines = lines.data; S.adjustments = adj.data;
   const ids = S.lines.map(l => l.id);
@@ -206,6 +204,27 @@ async function loadAll() {
   S.stock = {}; S.stockAt = {};
   for (const r of st) { (S.stock[r.sku] ||= {})[r.location_name] = r.available; if (!S.stockAt[r.sku] || r.synced_at > S.stockAt[r.sku]) S.stockAt[r.sku] = r.synced_at; }
   S.loadedAt = new Date().toISOString();
+}
+
+// Tracker orders (admin only): the whole year, so they're loaded on their own, in pages of 1,000 (the most the
+// database returns per request), when the Tracker is opened — not with every 60-second refresh of the board.
+const SLA_COLS = 'order_name,created_at,first_fulfilled_at,cancelled_at,source_name,location_name,fulfillment_status,customer_name,customer_email,synced_at';
+async function loadSla(force) {
+  if (!isAdmin() || S.slaLoading) return;
+  if (!force && S.slaLoadedAt && Date.now() - S.slaLoadedAt < 5 * 60e3) return;
+  S.slaLoading = true;
+  try {
+    const rows = [];
+    for (let from = 0; from < 60000; from += 1000) {
+      const r = await supa.from('ful_sla_orders').select(SLA_COLS).order('created_at', { ascending:false }).range(from, from + 999);
+      if (r.error) throw r.error;
+      rows.push(...r.data);
+      if (r.data.length < 1000) break;
+    }
+    S.sla = rows; S.slaLoadedAt = Date.now();
+  } catch (e) { console.error(e); toast('Couldn’t load the tracker orders: ' + (e.message || e)); }
+  S.slaLoading = false;
+  render();
 }
 
 async function act(fn, okMsg) {
@@ -918,7 +937,7 @@ function renderTabs() {
     ...(isAdmin() ? [['tracker', 'Tracker', slaOverdue], ['reports', 'Reports'], ['adjust', 'HQ stock adjustments', adjOpen], ['stores', 'Stores']] : []),
   ];
   document.getElementById('tabs').replaceChildren(...tabs.map(([k, label, n]) =>
-    h('button', { class:'tab', role:'tab', 'aria-selected': String(S.view === k), onclick: () => { S.view = k; render(); } }, label, n ? h('span', { class:'n' }, n) : null)));
+    h('button', { class:'tab', role:'tab', 'aria-selected': String(S.view === k), onclick: () => { S.view = k; render(); if (k === 'tracker') loadSla(); } }, label, n ? h('span', { class:'n' }, n) : null)));
 }
 
 // Stock as small labelled counters: HQ, the store being asked, and how many other stores have it
@@ -1489,6 +1508,10 @@ const tipShow = (e, text) => { const t = vizTip(); t.textContent = text; t.style
 const tipMove = e => { const t = vizTip(); t.style.left = Math.min(e.clientX + 14, innerWidth - 180) + 'px'; t.style.top = (e.clientY - 12) + 'px'; };
 const tipHide = () => { vizTip().style.display = 'none'; };
 const dayLabel = day => new Date(day + 'T12:00:00').toLocaleDateString('en-ZA', { weekday:'short', day:'numeric', month:'short' });
+// Charts and the table group by day, or by week (Monday–Sunday) when the period is long, so a year stays readable
+const weekStart = day => { const d = new Date(day + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7)); return d.toISOString().slice(0, 10); };
+const bucketLabel = (key, gran) => gran === 'week' ? 'Week of ' + new Date(key + 'T12:00:00').toLocaleDateString('en-ZA', { day:'numeric', month:'short' }) : dayLabel(key);
+const axisLabel = (key, gran) => gran === 'week' ? new Date(key + 'T12:00:00').toLocaleDateString('en-ZA', { day:'numeric', month:'short' }) : String(Number(key.slice(8)));
 
 // Bar with a rounded top (data end) and a square baseline
 const topRect = (x, y, w, hgt, fill, rounded, extra) => {
@@ -1496,7 +1519,9 @@ const topRect = (x, y, w, hgt, fill, rounded, extra) => {
   return sv('path', { d:`M${x},${y + hgt} V${y + r} Q${x},${y} ${x + r},${y} H${x + w - r} Q${x + w},${y} ${x + w},${y + r} V${y + hgt} Z`, fill, ...(extra || {}) });
 };
 
-function slaCharts(daysAsc, openDay) {
+function slaCharts(daysAsc, openDay, gran = 'day') {
+  const unit = gran === 'week' ? 'week' : 'day';
+  const every = Math.max(1, Math.ceil(daysAsc.length / (gran === 'week' ? 12 : 20)));   // label every Nth tick
   const W = 560, H = 230, P = { l: 30, r: 8, t: 10, b: 24 };
   const iw = W - P.l - P.r, ih = H - P.t - P.b;
   const n = daysAsc.length;
@@ -1510,7 +1535,7 @@ function slaCharts(daysAsc, openDay) {
   // Chart 1: each day's orders, stacked by outcome (met + missed + open = placed)
   const defs = sv('defs', null, sv('pattern', { id:'slaHatch', patternUnits:'userSpaceOnUse', width:'5', height:'5', patternTransform:'rotate(45)' },
     sv('rect', { width:'5', height:'5', fill: VIZ.miss }), sv('line', { x1:'0', y1:'0', x2:'0', y2:'5', stroke:'rgba(10,10,10,.5)', 'stroke-width':'2' })));
-  const bars = sv('svg', { viewBox:`0 0 ${W} ${H}`, role:'img', 'aria-label':'Orders per day by outcome' }, defs);
+  const bars = sv('svg', { viewBox:`0 0 ${W} ${H}`, role:'img', 'aria-label':'Orders per ' + unit + ' by outcome' }, defs);
   for (let g = 0; g <= 4; g++) {
     const gy = y(g * yTick);
     bars.append(sv('line', { x1: P.l, x2: W - P.r, y1: gy, y2: gy, stroke: VIZ.grid, 'stroke-width': 1 }));
@@ -1518,7 +1543,7 @@ function slaCharts(daysAsc, openDay) {
   }
   daysAsc.forEach((d, i) => {
     const x0 = xc(i) - bw / 2;
-    const tip = `${dayLabel(d.day)} — ${d.total} placed\nOut in SLA ${d.m} · Missed ${d.miss} · Open ${d.op}`;
+    const tip = `${bucketLabel(d.day, gran)} — ${d.total} placed\nOut in SLA ${d.m} · Missed ${d.miss} · Open ${d.op}`;
     const hover = { class:'bar', onmouseenter: e => tipShow(e, tip), onmousemove: tipMove, onmouseleave: tipHide, onclick: () => openDay(d.day) };
     const segs = [[d.m, VIZ.met], [d.miss, 'url(#slaHatch)'], [d.op, VIZ.open]].filter(s => s[0] > 0);
     let acc = 0;
@@ -1528,12 +1553,12 @@ function slaCharts(daysAsc, openDay) {
         : sv('rect', { x: x0, y: yTopSeg, width: bw, height: hgt, fill, ...hover }));
       acc += v;
     });
-    if (n <= 20 || i % 2 === 0) bars.append(sv('text', { x: xc(i), y: H - 8, 'text-anchor':'middle', 'font-size':'9', fill: VIZ.axis },
-      String(Number(d.day.slice(8)))));
+    if (i % every === 0) bars.append(sv('text', { x: xc(i), y: H - 8, 'text-anchor':'middle', 'font-size':'9', fill: VIZ.axis },
+      axisLabel(d.day, gran)));
   });
   const chip = (c, label, hatch) => h('span', null, h('i', { style:`background:${hatch ? 'repeating-linear-gradient(45deg,' + VIZ.miss + ' 0 3px, rgba(10,10,10,.5) 3px 5px)' : c}` }), label);
   const c1 = h('div', { class:'chart' },
-    h('div', null, h('div', { class:'chart-title' }, 'Orders per day'), h('div', { class:'dim xs' }, 'Click a bar for that day’s orders.')),
+    h('div', null, h('div', { class:'chart-title' }, `Orders per ${unit}`), h('div', { class:'dim xs' }, `Click a bar for that ${unit}’s orders.`)),
     h('div', { class:'legend' }, chip(VIZ.met, 'Out in SLA'), chip(VIZ.miss, 'Missed', true), chip(VIZ.open, 'Still open')),
     bars);
 
@@ -1549,15 +1574,15 @@ function slaCharts(daysAsc, openDay) {
   line.append(sv('text', { x: W - P.r, y: y2(SLA_TARGET) - 4, 'text-anchor':'end', 'font-size':'9', fill: VIZ.axis }, `Target ${SLA_TARGET}%`));
   if (pts.length > 1) line.append(sv('polyline', { points: pts.map(d => `${xc(d.i)},${y2(d.p)}`).join(' '), fill:'none', stroke: VIZ.open, 'stroke-width': 2, 'stroke-linejoin':'round', 'stroke-linecap':'round' }));
   pts.forEach((d, k) => {
-    const tip = `${dayLabel(d.day)} — ${d.p}%${d.op ? ' so far' : ''} (${d.m} of ${d.m + d.miss} decided)`;
+    const tip = `${bucketLabel(d.day, gran)} — ${d.p}%${d.op ? ' so far' : ''} (${d.m} of ${d.m + d.miss} decided)`;
     line.append(sv('circle', { cx: xc(d.i), cy: y2(d.p), r: 3.5, fill: d.op ? 'var(--tile)' : VIZ.open, stroke: VIZ.open, 'stroke-width': 2 }));
     line.append(sv('circle', { cx: xc(d.i), cy: y2(d.p), r: 10, fill:'transparent', class:'bar',
       onmouseenter: e => tipShow(e, tip), onmousemove: tipMove, onmouseleave: tipHide, onclick: () => openDay(d.day) }));
     if (k === pts.length - 1) line.append(sv('text', { x: xc(d.i), y: y2(d.p) - 8, 'text-anchor':'middle', 'font-size':'10', 'font-weight':'600', fill:'#fafafa' }, d.p + '%'));
   });
-  daysAsc.forEach((d, i) => { if (n <= 20 || i % 2 === 0) line.append(sv('text', { x: xc(i), y: H - 8, 'text-anchor':'middle', 'font-size':'9', fill: VIZ.axis }, String(Number(d.day.slice(8))))); });
+  daysAsc.forEach((d, i) => { if (i % every === 0) line.append(sv('text', { x: xc(i), y: H - 8, 'text-anchor':'middle', 'font-size':'9', fill: VIZ.axis }, axisLabel(d.day, gran))); });
   const c2 = h('div', { class:'chart' },
-    h('div', null, h('div', { class:'chart-title' }, 'Out within SLA, day by day (%)'), h('div', { class:'dim xs' }, 'Hollow points: some of that day’s orders are still open, so the % can change.')),
+    h('div', null, h('div', { class:'chart-title' }, `Out within SLA, ${unit} by ${unit} (%)`), h('div', { class:'dim xs' }, `Hollow points: some of that ${unit}’s orders are still open, so the % can change.`)),
     line);
   return h('div', { class:'charts' }, c1, c2);
 }
@@ -1602,32 +1627,52 @@ function renderTracker(main) {
       e.target.disabled = true; e.target.textContent = 'Pulling…';
       try {
         const r = await callSync({ sla: true });
-        await loadAll();
-        toast((r.warnings || []).length ? r.warnings.join(' ') : 'Orders updated');
+        await loadSla(true);
+        toast((r.warnings || []).length ? r.warnings.join(' ') : 'Recent orders updated');
       }
       catch (err) { toast('Pull failed: ' + err.message); }
       render();
-    } }, 'Pull orders now'))));
+    } }, 'Pull recent orders now'))));
+  if (S.sla == null) { main.append(h('div', { class:'empty' }, 'Loading the orders…')); return; }
   const all = slaOrders();
-  if (!all.length) { main.append(h('div', { class:'empty' }, 'No orders pulled yet — click “Pull orders now”.')); return; }
-  main.append(h('div', { class:'dim sm' }, `Orders last pulled ${when(all.map(o => o.synced_at).sort().pop())}. Pulled automatically at 07:10, 11:10, 15:10 and 18:10, Mon–Sat.`));
+  if (!all.length) { main.append(h('div', { class:'empty' }, 'No orders pulled yet — click “Pull recent orders now”.')); return; }
+
+  main.append(h('div', { class:'dim sm' }, `${all.length.toLocaleString('en-ZA')} online orders since ${dayLabel(all.map(o => slaDayKey(o.created_at)).sort()[0])}. Last pulled ${when(all.map(o => o.synced_at).sort().pop())}: the last 45 days at 07:10, 11:10, 15:10 and 18:10 (Mon–Sat), and the whole year again every night.`));
 
   // Slicers: everything below (tiles, charts, day table, backlog) follows them
-  const T = S.trk ||= { range:'month', ship:'all' };
-  const slicer = (label, key, opts) => h('div', { class:'slicer' }, h('span', { class:'slicer-l' }, label),
-    h('div', { class:'toggle', role:'group', 'aria-label':label }, ...opts.map(([v, text]) =>
-      h('button', { 'aria-pressed': String(T[key] === v), onclick: () => { T[key] = v; render(); } }, text))));
+  const T = S.trk ||= { range:'month', month:'', from:'', to:'', ship:'all' };
+  const rangeIsQuick = !T.month && !T.from && !T.to;
+  const quick = (v, text) => h('button', { 'aria-pressed': String(rangeIsQuick && T.range === v), onclick: () => { Object.assign(T, { range: v, month:'', from:'', to:'' }); render(); } }, text);
+  const monthKeys = [...new Set(all.map(o => slaDayKey(o.created_at).slice(0, 7)))].sort().reverse();
+  const monthName = k => new Date(k + '-15T12:00:00').toLocaleDateString('en-ZA', { month:'long', year:'numeric' });
+  const monthSel = h('select', { class:'input slicer-input', 'aria-label':'Month', onchange: e => { Object.assign(T, { month: e.target.value, from:'', to:'' }); render(); } },
+    h('option', { value:'' }, 'Any'), ...monthKeys.map(k => h('option', { value:k, selected: T.month === k }, monthName(k))));
+  const dateIn = (key, label) => h('input', { class:'input slicer-input', type:'date', value: T[key], 'aria-label':label,
+    onchange: e => { T[key] = e.target.value; T.month = ''; render(); } });
   const nSplit = all.filter(isSplitOrder).length;
+  const shipBtn = (v, text) => h('button', { 'aria-pressed': String(T.ship === v), onclick: () => { T.ship = v; render(); } }, text);
   main.append(h('div', { class:'slicers' },
-    slicer('Period', 'range', [['month', 'This month'], ['7', 'Last 7 days'], ['30', 'Last 30 days'], ['all', 'Last 45 days']]),
-    slicer('Shipment', 'ship', [['all', `All HQ orders (${all.length})`], ['hq', `HQ only (${all.length - nSplit})`], ['split', `Split with a store (${nSplit})`]])));
+    h('div', { class:'slicer' }, h('span', { class:'slicer-l' }, 'Period'),
+      h('div', { class:'toggle', role:'group', 'aria-label':'Period' }, quick('month', 'This month'), quick('7', 'Last 7 days'), quick('30', 'Last 30 days'), quick('ytd', 'Year to date'))),
+    h('div', { class:'slicer' }, h('span', { class:'slicer-l' }, 'Month'), monthSel),
+    h('div', { class:'slicer' }, h('span', { class:'slicer-l' }, 'From'), dateIn('from', 'From date'), h('span', { class:'slicer-l' }, 'to'), dateIn('to', 'To date'),
+      (T.from || T.to || T.month) ? h('button', { class:'btn sm ghost', onclick: () => { Object.assign(T, { range:'month', month:'', from:'', to:'' }); render(); } }, 'Clear') : null),
+    h('div', { class:'slicer' }, h('span', { class:'slicer-l' }, 'Shipment'),
+      h('div', { class:'toggle', role:'group', 'aria-label':'Shipment' }, shipBtn('all', `All HQ orders (${all.length.toLocaleString('en-ZA')})`), shipBtn('hq', `HQ only (${(all.length - nSplit).toLocaleString('en-ZA')})`), shipBtn('split', `Split with a store (${nSplit})`)))));
 
   const shipOk = o => T.ship === 'all' || (T.ship === 'split') === isSplitOrder(o);
   const withSt = all.filter(shipOk).map(o => ({ o, st: slaStatus(o), day: slaDayKey(o.created_at) }));
   const todayKey = slaDayKey(new Date().toISOString());
   const dayFrom = n => slaDayKey(new Date(Date.now() - (n - 1) * 864e5).toISOString());
-  const inRange = x => T.range === 'month' ? x.day.startsWith(todayKey.slice(0, 7)) : T.range === 'all' ? true : x.day >= dayFrom(Number(T.range));
-  const RANGE_TEXT = { month:'this month', '7':'last 7 days', '30':'last 30 days', all:'last 45 days' }[T.range];
+  const fromDay = T.from || '0000-00-00', toDay = T.to || '9999-99-99';
+  const inRange = x => T.from || T.to ? (x.day >= fromDay && x.day <= toDay)
+    : T.month ? x.day.startsWith(T.month)
+    : T.range === 'month' ? x.day.startsWith(todayKey.slice(0, 7))
+    : T.range === 'ytd' ? x.day.startsWith(todayKey.slice(0, 4))
+    : x.day >= dayFrom(Number(T.range));
+  const RANGE_TEXT = T.from || T.to ? `${T.from ? dayLabel(T.from) : 'the start'} to ${T.to ? dayLabel(T.to) : 'today'}`
+    : T.month ? monthName(T.month)
+    : { month:'this month', '7':'last 7 days', '30':'last 30 days', ytd:'this year' }[T.range];
   const month = withSt.filter(inRange);   // (the selected period)
   const missedList = month.filter(x => x.st === 'late' || x.st === 'overdue');
   const met = month.filter(x => x.st === 'met').length;
@@ -1639,16 +1684,21 @@ function renderTracker(main) {
   if (!withSt.length) { main.append(h('div', { class:'empty' }, 'No orders match these filters.')); return; }
   // Each tile opens the orders behind its number
   const tile = (v, t, s, cls, xs, title) => h('button', { class:'cat tile-btn' + (cls || ''), title:'Click to see the orders', onclick: () => openSlaList(title, xs) },
-    h('span', { class:'cat-v' }, String(v)), h('span', { class:'cat-t' }, t), h('span', { class:'cat-s' }, s));
+    h('span', { class:'cat-v' }, typeof v === 'number' ? v.toLocaleString('en-ZA') : String(v)), h('span', { class:'cat-t' }, t), h('span', { class:'cat-s' }, s));
   main.append(h('div', { class:'cats' },
     tile(month.length, 'Online orders', 'placed ' + RANGE_TEXT, '', month, 'Online orders placed ' + RANGE_TEXT),
     tile(pct == null ? '–' : pct + '%', 'Out within SLA', `${RANGE_TEXT} · target ${SLA_TARGET}%`, pct != null && pct < SLA_TARGET ? ' late-cat' : '', month.filter(x => x.st === 'met'), 'Out within the SLA, ' + RANGE_TEXT),
     tile(missed, 'Missed the SLA', RANGE_TEXT, missed ? ' late-cat' : '', missedList, 'Missed the SLA, ' + RANGE_TEXT),
     tile(overdueAll ? `${openAll} · ${overdueAll}` : openAll, 'Not yet out', overdueAll ? 'open, in time · overdue' : 'all still inside 2 days', overdueAll ? ' late-cat' : '', notOut, 'Not yet out')));
 
-  // The selected period, day by day: the charts and the table work off the same numbers; click either for the day's orders
+  // The selected period, by day (or by week when it spans more than ~2 months): the charts and the table work
+  // off the same numbers; click either for that day's / week's orders
+  const dayKeys = [...new Set(month.map(x => x.day))].sort();
+  const spanDays = dayKeys.length ? (new Date(dayKeys.at(-1)) - new Date(dayKeys[0])) / 864e5 : 0;
+  const gran = spanDays > 62 ? 'week' : 'day';
+  const unitName = gran === 'week' ? 'Week' : 'Day';
   const days = {};
-  for (const x of month) (days[x.day] ||= []).push(x);
+  for (const x of month) (days[gran === 'week' ? weekStart(x.day) : x.day] ||= []).push(x);
   const daysAsc = Object.keys(days).sort().map(day => {
     const xs = days[day];
     const m = xs.filter(x => x.st === 'met').length;
@@ -1656,15 +1706,15 @@ function renderTracker(main) {
     const op = xs.filter(x => x.st === 'open').length;
     return { day, m, miss, op, total: xs.length, p: m + miss ? Math.round(100 * m / (m + miss)) : null };
   });
-  const openDay = day => openSlaList(dayLabel(day), days[day]);
-  if (daysAsc.length) main.append(slaCharts(daysAsc, openDay));
+  const openDay = day => openSlaList(bucketLabel(day, gran), days[day]);
+  if (daysAsc.length) main.append(slaCharts(daysAsc, openDay, gran));
 
-  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Day by day', h('span', { class:'count' }, daysAsc.length)),
-    h('p', { class:'muted sm' }, 'Orders by the day they were placed. “Missed” means the first parcel went out late, or still hasn’t and the 2 days are up. Click a day for its orders.'))));
-  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Day','Placed','Out in SLA','Missed','Open, in time','SLA %'].map(t => h('th', null, t))));
+  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, gran === 'week' ? 'Week by week' : 'Day by day', h('span', { class:'count' }, daysAsc.length)),
+    h('p', { class:'muted sm' }, `Orders by the ${unitName.toLowerCase()} they were placed${gran === 'week' ? ' (Monday to Sunday)' : ''}. “Missed” means the first parcel went out late, or still hasn’t and the 2 days are up. Click a ${unitName.toLowerCase()} for its orders.`))));
+  const tbl = h('table', { class:'plain' }, h('tr', null, ...[unitName,'Placed','Out in SLA','Missed','Open, in time','SLA %'].map(t => h('th', null, t))));
   for (const d of [...daysAsc].reverse()) {
     tbl.append(h('tr', { class:'rowlink', onclick: () => openDay(d.day) },
-      h('td', { class:'mono' }, dayLabel(d.day)),
+      h('td', { class:'mono' }, bucketLabel(d.day, gran)),
       h('td', { class:'mono' }, String(d.total)),
       h('td', { class:'mono' }, String(d.m)),
       h('td', { class:'mono', style: d.miss ? 'color:var(--warn)' : null }, String(d.miss)),
@@ -1896,6 +1946,7 @@ async function start(session) {
   document.getElementById('loginView').hidden = true; document.getElementById('appView').hidden = false;
   try { await loadAll(); } catch (e) { console.error(e); toast('Couldn’t load: ' + e.message); }
   render();
+  if (role === 'admin') loadSla(true);   // in the background: fills the Tracker (and its tab badge)
   // Is the Aramex login set up? (no Aramex call is made — the function only checks its own secrets)
   if (role === 'admin' && CONFIG.ARAMEX_ENABLED) callAramex({ action:'status' }).then(r => { S.aramexReady = !!r.configured; render(); }).catch(() => { S.aramexReady = false; });
 }
@@ -1947,6 +1998,7 @@ supa.auth.getSession().then(({ data }) => start(data.session));
 setInterval(() => {
   const busy = document.getElementById('modalRoot').children.length || S.view === 'stores' || ['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName) || [...document.querySelectorAll('textarea')].some(t => t.value.trim());
   if (S.role && document.visibilityState === 'visible' && !busy) act(async () => {});
+  if (S.role === 'admin' && document.visibilityState === 'visible' && !busy) loadSla();   // at most every 5 minutes
 }, 60000);
 </script>
 </body>
