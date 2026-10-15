@@ -1817,12 +1817,14 @@ function renderReports(main) {
   main.append(h('div', { class:'card', style:'overflow-x:auto' }, tt));
 }
 
+// Why an item is on the adjustment sheet
+const ADJ_WHY = { not_found:'Not found at HQ', refund:'Refunded – no stock anywhere' };
 // HQ stock adjustments as a CSV for the stock team (opens in Excel)
 function downloadAdjustmentsCsv(onlyOpen) {
   const rows = S.adjustments.filter(a => !onlyOpen || !a.resolved_at);
   const cell = v => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-  const csv = [['Reported','SKU','Item','Order','HQ showed','Status'], ...rows.map(a => [
-    new Date(a.reported_at).toLocaleString('en-ZA'), '="' + a.sku + '"', a.item_name, a.order_name, a.hq_available, a.resolved_at ? 'Adjusted ' + new Date(a.resolved_at).toLocaleDateString('en-ZA') : 'To adjust'])]
+  const csv = [['Reported','SKU','Item','Order','Why','HQ showed','Status'], ...rows.map(a => [
+    new Date(a.reported_at).toLocaleString('en-ZA'), '="' + a.sku + '"', a.item_name, a.order_name, ADJ_WHY[a.reason] || ADJ_WHY.not_found, a.hq_available, a.resolved_at ? 'Adjusted ' + new Date(a.resolved_at).toLocaleDateString('en-ZA') : 'To adjust'])]
     .map(r => r.map(cell).join(',')).join('\r\n');
   const a = h('a', { href: URL.createObjectURL(new Blob(['﻿' + csv], { type:'text/csv' })), download: `HQ stock adjustments ${new Date().toLocaleDateString('en-CA')}.csv` });
   document.body.append(a); a.click(); a.remove();
@@ -1846,15 +1848,16 @@ function renderAdjust(main) {
     main.append(h('div', { class:'card', style:'overflow-x:auto' }, ft));
   }
 
-  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Not found – adjust stock', h('span', { class:'count' }, S.adjustments.filter(a => !a.resolved_at).length)),
-    h('p', { class:'muted sm' }, 'HQ’s system showed stock but the warehouse couldn’t find it. These need a stock adjustment.')),
+  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Adjust HQ stock', h('span', { class:'count' }, S.adjustments.filter(a => !a.resolved_at).length)),
+    h('p', { class:'muted sm' }, 'HQ couldn’t find these, so HQ’s system count needs adjusting down: items the warehouse recheck couldn’t find, and every item refunded because no store had it either. Check “HQ showed” – where it is already 0, HQ’s system is right and there is nothing to adjust.')),
     S.adjustments.length ? h('div', { class:'actions' },
       h('button', { class:'btn sm', onclick: () => downloadAdjustmentsCsv(true) }, 'Download to adjust (CSV)'),
       h('button', { class:'btn ghost sm', onclick: () => downloadAdjustmentsCsv(false) }, 'Download all')) : null));
   if (!S.adjustments.length) { main.append(h('div', { class:'empty' }, 'Nothing logged yet.')); return; }
-  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Reported','SKU','Item','Order','HQ showed','Status',''].map(t => h('th', null, t))));
+  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Reported','SKU','Item','Order','Why','HQ showed','Status',''].map(t => h('th', null, t))));
   for (const a of S.adjustments) tbl.append(h('tr', null,
     h('td', { class:'mono' }, when(a.reported_at)), h('td', { class:'mono' }, a.sku), h('td', null, a.item_name || ''), h('td', { class:'mono' }, a.order_name || ''),
+    h('td', null, h('span', { class:'badge ' + (a.reason === 'refund' ? 'b-hold' : 'b-wait'), title: a.reason === 'refund' ? 'Marked for refund: no store could supply it' : 'The warehouse recheck couldn’t find it' }, ADJ_WHY[a.reason] || ADJ_WHY.not_found)),
     h('td', { class:'mono' }, String(a.hq_available ?? '')),
     h('td', null, a.resolved_at ? h('span', { class:'badge b-sent' }, 'Adjusted ' + when(a.resolved_at)) : h('span', { class:'badge b-wait' }, 'To adjust')),
     h('td', null, isAdmin() && !a.resolved_at ? h('button', { class:'btn sm', onclick: () => act(async () => {
