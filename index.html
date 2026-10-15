@@ -1562,14 +1562,18 @@ function slaCharts(daysAsc, openDay) {
   return h('div', { class:'charts' }, c1, c2);
 }
 
-// Drill-down: one day's orders in full
-function openSlaDay(day, xs) {
+// Orders assigned to HQ and a store at once are split shipments (HQ ships its part, a store ships the rest)
+const isSplitOrder = o => String(o.location_name || '').includes(',');
+const otherStores = o => String(o.location_name || '').split(',').map(s => s.trim()).filter(s => s && s !== hqLoc()).map(short).join(', ');
+
+// Drill-down: a list of orders in full (a day, or a tile's group), oldest first
+function openSlaList(title, xs) {
   closeModal();
   const sorted = [...xs].sort((a, b) => String(a.o.created_at).localeCompare(String(b.o.created_at)));
   const m = xs.filter(x => x.st === 'met').length, miss = xs.filter(x => x.st === 'late' || x.st === 'overdue').length, op = xs.filter(x => x.st === 'open').length;
   const SLA_CELL = { met: ['b-sent', 'Out in time'], late: ['b-bad', 'Out late'], overdue: ['b-bad', 'Overdue'], open: ['b-wait', 'Open'] };
-  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Order','Customer','Placed','First parcel out','Took','SLA'].map(t => h('th', null, t))));
-  for (const x of sorted) {
+  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Order','Customer','Placed','First parcel out','Took','Shipment','SLA'].map(t => h('th', null, t))));
+  for (const x of sorted.slice(0, 400)) {
     const [cls, label] = SLA_CELL[x.st];
     tbl.append(h('tr', null,
       h('td', { class:'mono' }, h('a', { href:'#' + x.o.order_name, onclick: e => { e.preventDefault(); closeModal(); S.view = 'lookup'; S.query = x.o.order_name; render(); } }, x.o.order_name)),
@@ -1577,14 +1581,16 @@ function openSlaDay(day, xs) {
       h('td', { class:'mono' }, when(x.o.created_at)),
       h('td', { class:'mono' }, x.o.first_fulfilled_at ? when(x.o.first_fulfilled_at) : '—'),
       h('td', { class:'mono' }, x.o.first_fulfilled_at ? hText(hoursBetween(x.o.created_at, x.o.first_fulfilled_at)) : '—'),
+      h('td', null, isSplitOrder(x.o) ? h('span', { class:'ship-tag split', title:'HQ ships part of this order; a store ships the rest' }, 'Split · ' + otherStores(x.o)) : 'HQ only'),
       h('td', null, h('span', { class:'badge ' + cls }, label))));
   }
   const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
-    h('div', { class:'modal wide-modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Orders for ' + dayLabel(day) },
-      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, dayLabel(day)),
+    h('div', { class:'modal wide-modal', role:'dialog', 'aria-modal':'true', 'aria-label':title },
+      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, title),
         h('span', { class:'muted' }, `${xs.length} order${xs.length === 1 ? '' : 's'} · ${m} out in SLA · ${miss} missed · ${op} open`),
         h('button', { class:'btn sm ghost', style:'margin-left:auto', onclick: closeModal }, 'Close')),
-      h('div', { class:'modal-body' }, h('div', { class:'card', style:'overflow-x:auto' }, tbl))));
+      h('div', { class:'modal-body' }, h('div', { class:'card', style:'overflow-x:auto' }, tbl),
+        sorted.length > 400 ? h('div', { class:'muted sm' }, `Showing the first 400 of ${sorted.length}.`) : null)));
   document.getElementById('modalRoot').append(bg);
 }
 
@@ -1606,23 +1612,41 @@ function renderTracker(main) {
   if (!all.length) { main.append(h('div', { class:'empty' }, 'No orders pulled yet — click “Pull orders now”.')); return; }
   main.append(h('div', { class:'dim sm' }, `Orders last pulled ${when(all.map(o => o.synced_at).sort().pop())}. Pulled automatically at 07:10, 11:10, 15:10 and 18:10, Mon–Sat.`));
 
-  const withSt = all.map(o => ({ o, st: slaStatus(o), day: slaDayKey(o.created_at) }));
-  const monthKey = slaDayKey(new Date().toISOString()).slice(0, 7);
-  const month = withSt.filter(x => x.day.startsWith(monthKey));
+  // Slicers: everything below (tiles, charts, day table, backlog) follows them
+  const T = S.trk ||= { range:'month', ship:'all' };
+  const slicer = (label, key, opts) => h('div', { class:'slicer' }, h('span', { class:'slicer-l' }, label),
+    h('div', { class:'toggle', role:'group', 'aria-label':label }, ...opts.map(([v, text]) =>
+      h('button', { 'aria-pressed': String(T[key] === v), onclick: () => { T[key] = v; render(); } }, text))));
+  const nSplit = all.filter(isSplitOrder).length;
+  main.append(h('div', { class:'slicers' },
+    slicer('Period', 'range', [['month', 'This month'], ['7', 'Last 7 days'], ['30', 'Last 30 days'], ['all', 'Last 45 days']]),
+    slicer('Shipment', 'ship', [['all', `All HQ orders (${all.length})`], ['hq', `HQ only (${all.length - nSplit})`], ['split', `Split with a store (${nSplit})`]])));
+
+  const shipOk = o => T.ship === 'all' || (T.ship === 'split') === isSplitOrder(o);
+  const withSt = all.filter(shipOk).map(o => ({ o, st: slaStatus(o), day: slaDayKey(o.created_at) }));
+  const todayKey = slaDayKey(new Date().toISOString());
+  const dayFrom = n => slaDayKey(new Date(Date.now() - (n - 1) * 864e5).toISOString());
+  const inRange = x => T.range === 'month' ? x.day.startsWith(todayKey.slice(0, 7)) : T.range === 'all' ? true : x.day >= dayFrom(Number(T.range));
+  const RANGE_TEXT = { month:'this month', '7':'last 7 days', '30':'last 30 days', all:'last 45 days' }[T.range];
+  const month = withSt.filter(inRange);   // (the selected period)
+  const missedList = month.filter(x => x.st === 'late' || x.st === 'overdue');
   const met = month.filter(x => x.st === 'met').length;
-  const missed = month.filter(x => x.st === 'late' || x.st === 'overdue').length;
-  const openAll = withSt.filter(x => x.st === 'open').length;
-  const overdueAll = withSt.filter(x => x.st === 'overdue').length;
+  const missed = missedList.length;
+  const notOut = withSt.filter(x => x.st === 'open' || x.st === 'overdue');   // the backlog ignores the period: it's what's open now
+  const openAll = notOut.filter(x => x.st === 'open').length;
+  const overdueAll = notOut.length - openAll;
   const pct = met + missed ? Math.round(100 * met / (met + missed)) : null;   // orders whose outcome is known
-  const tile = (v, t, s, cls) => h('div', { class:'cat static-cat' + (cls || '') },
+  if (!withSt.length) { main.append(h('div', { class:'empty' }, 'No orders match these filters.')); return; }
+  // Each tile opens the orders behind its number
+  const tile = (v, t, s, cls, xs, title) => h('button', { class:'cat tile-btn' + (cls || ''), title:'Click to see the orders', onclick: () => openSlaList(title, xs) },
     h('span', { class:'cat-v' }, String(v)), h('span', { class:'cat-t' }, t), h('span', { class:'cat-s' }, s));
   main.append(h('div', { class:'cats' },
-    tile(month.length, 'Online orders', 'placed this month'),
-    tile(pct == null ? '–' : pct + '%', 'Out within SLA', `this month · target ${SLA_TARGET}%`, pct != null && pct < SLA_TARGET ? ' late-cat' : ''),
-    tile(missed, 'Missed the SLA', 'this month'),
-    tile(overdueAll ? `${openAll} · ${overdueAll}` : openAll, 'Not yet out', overdueAll ? 'open, in time · overdue' : 'all still inside 2 days', overdueAll ? ' late-cat' : '')));
+    tile(month.length, 'Online orders', 'placed ' + RANGE_TEXT, '', month, 'Online orders placed ' + RANGE_TEXT),
+    tile(pct == null ? '–' : pct + '%', 'Out within SLA', `${RANGE_TEXT} · target ${SLA_TARGET}%`, pct != null && pct < SLA_TARGET ? ' late-cat' : '', month.filter(x => x.st === 'met'), 'Out within the SLA, ' + RANGE_TEXT),
+    tile(missed, 'Missed the SLA', RANGE_TEXT, missed ? ' late-cat' : '', missedList, 'Missed the SLA, ' + RANGE_TEXT),
+    tile(overdueAll ? `${openAll} · ${overdueAll}` : openAll, 'Not yet out', overdueAll ? 'open, in time · overdue' : 'all still inside 2 days', overdueAll ? ' late-cat' : '', notOut, 'Not yet out')));
 
-  // This month, day by day: the charts and the table work off the same numbers; click either for the day's orders
+  // The selected period, day by day: the charts and the table work off the same numbers; click either for the day's orders
   const days = {};
   for (const x of month) (days[x.day] ||= []).push(x);
   const daysAsc = Object.keys(days).sort().map(day => {
@@ -1632,7 +1656,7 @@ function renderTracker(main) {
     const op = xs.filter(x => x.st === 'open').length;
     return { day, m, miss, op, total: xs.length, p: m + miss ? Math.round(100 * m / (m + miss)) : null };
   });
-  const openDay = day => openSlaDay(day, days[day]);
+  const openDay = day => openSlaList(dayLabel(day), days[day]);
   if (daysAsc.length) main.append(slaCharts(daysAsc, openDay));
 
   main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Day by day', h('span', { class:'count' }, daysAsc.length)),
@@ -1664,12 +1688,13 @@ function renderTracker(main) {
       ? h('span', { class:'badge b-wait' }, 'Due today')
       : h('span', { class:'badge' }, 'Due ' + due.toLocaleDateString('en-ZA', { weekday:'short', day:'numeric', month:'short' }));
   };
-  const bt = h('table', { class:'plain' }, h('tr', null, ...['SLA','Order','Customer','Placed','Shopify'].map(t => h('th', null, t))));
+  const bt = h('table', { class:'plain' }, h('tr', null, ...['SLA','Order','Customer','Placed','Shipment','Shopify'].map(t => h('th', null, t))));
   for (const x of backlog.slice(0, 200)) bt.append(h('tr', null,
     h('td', null, dueCell(x)),
     h('td', { class:'mono' }, h('a', { href:'#' + x.o.order_name, onclick: e => { e.preventDefault(); S.view = 'lookup'; S.query = x.o.order_name; render(); } }, x.o.order_name)),
     h('td', { title: x.o.customer_email || null }, x.o.customer_name || ''),
     h('td', { class:'mono' }, when(x.o.created_at)),
+    h('td', null, isSplitOrder(x.o) ? h('span', { class:'ship-tag split' }, 'Split · ' + otherStores(x.o)) : 'HQ only'),
     h('td', null, (x.o.fulfillment_status || '').toLowerCase().replace(/_/g, ' '))));
   main.append(h('div', { class:'card', style:'overflow-x:auto' }, bt));
   if (backlog.length > 200) main.append(h('div', { class:'muted sm' }, `Showing the 200 most urgent of ${backlog.length}.`));
