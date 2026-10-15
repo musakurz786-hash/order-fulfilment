@@ -208,7 +208,7 @@ async function loadAll() {
 
 // Tracker orders (admin only): the whole year, so they're loaded on their own, in pages of 1,000 (the most the
 // database returns per request), when the Tracker is opened — not with every 60-second refresh of the board.
-const SLA_COLS = 'order_name,created_at,first_fulfilled_at,cancelled_at,source_name,location_name,fulfillment_status,customer_name,customer_email,synced_at';
+const SLA_COLS = 'order_name,created_at,first_fulfilled_at,cancelled_at,source_name,location_name,fulfillment_status,financial_status,items_left,customer_name,customer_email,synced_at';
 async function loadSla(force) {
   if (!isAdmin() || S.slaLoading) return;
   if (!force && S.slaLoadedAt && Date.now() - S.slaLoadedAt < 5 * 60e3) return;
@@ -1473,8 +1473,10 @@ function renderRefunds(main) {
 // ---------- SLA tracker (admin) ----------
 // Every online (web) order against the 2-working-day SLA: working days are Mon–Sat (Sundays don't count),
 // and the FIRST parcel manifested in Shopify stops the clock. All days are worked out in SA time.
-const SLA_WORKING_DAYS = 2, SLA_TARGET = 80, SAST_MS = 2 * 3600e3;
-const slaOrders = () => (S.sla || []).filter(o => !o.cancelled_at && o.source_name === 'web');
+const SLA_WORKING_DAYS = 2, SLA_TARGET = 90, SAST_MS = 2 * 3600e3;
+// Nothing left to ship = refunded in full / voided payment, or every item removed from the order: not SLA workload
+const nothingToShip = o => o.financial_status === 'REFUNDED' || o.financial_status === 'VOIDED' || o.items_left === 0;
+const slaOrders = () => (S.sla || []).filter(o => !o.cancelled_at && o.source_name === 'web' && !nothingToShip(o));
 const sastDate = iso => new Date(new Date(iso).getTime() + SAST_MS);   // read with getUTC* only
 const slaDayKey = iso => sastDate(iso).toISOString().slice(0, 10);
 function slaDueEnd(createdIso) {   // end of the 2nd working day after the day the order was placed
@@ -1562,7 +1564,7 @@ function slaCharts(daysAsc, openDay, gran = 'day') {
     h('div', { class:'legend' }, chip(VIZ.met, 'Out in SLA'), chip(VIZ.miss, 'Missed', true), chip(VIZ.open, 'Still open')),
     bars);
 
-  // Chart 2: the day's SLA % (single series) against the 80% target
+  // Chart 2: the day's SLA % (single series) against the SLA target
   const pts = daysAsc.map((d, i) => ({ ...d, i })).filter(d => d.p != null);
   const y2 = v => P.t + ih - (v / 100) * ih;
   const line = sv('svg', { viewBox:`0 0 ${W} ${H}`, role:'img', 'aria-label':'SLA percentage per day' });
@@ -1637,7 +1639,8 @@ function renderTracker(main) {
   const all = slaOrders();
   if (!all.length) { main.append(h('div', { class:'empty' }, 'No orders pulled yet — click “Pull recent orders now”.')); return; }
 
-  main.append(h('div', { class:'dim sm' }, `${all.length.toLocaleString('en-ZA')} online orders since ${dayLabel(all.map(o => slaDayKey(o.created_at)).sort()[0])}. Last pulled ${when(all.map(o => o.synced_at).sort().pop())}: the last 45 days at 07:10, 11:10, 15:10 and 18:10 (Mon–Sat), and the whole year again every night.`));
+  const nSkipped = S.sla.filter(o => !o.cancelled_at && o.source_name === 'web' && nothingToShip(o)).length;
+  main.append(h('div', { class:'dim sm' }, `${all.length.toLocaleString('en-ZA')} online orders since ${dayLabel(all.map(o => slaDayKey(o.created_at)).sort()[0])}${nSkipped ? ` (${nSkipped} refunded in full or emptied orders left out – nothing to ship)` : ''}. Last pulled ${when(all.map(o => o.synced_at).sort().pop())}: the last 45 days at 07:10, 11:10, 15:10 and 18:10 (Mon–Sat), and the whole year again every night.`));
 
   // Slicers: everything below (tiles, charts, day table, backlog) follows them
   const T = S.trk ||= { range:'month', month:'', from:'', to:'', ship:'all' };
