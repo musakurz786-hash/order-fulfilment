@@ -1474,7 +1474,7 @@ function renderRefunds(main) {
 }
 
 // ---------- SLA tracker (admin) ----------
-// Every online (web) order against the 2-working-day SLA: working days are Mon–Sat (Sundays don't count),
+// Every online (web) order against the 2-working-day SLA: working days are Mon–Fri (weekends don't count),
 // and the FIRST parcel manifested in Shopify stops the clock. All days are worked out in SA time.
 const SLA_WORKING_DAYS = 2, SLA_TARGET = 90, SAST_MS = 2 * 3600e3;
 // Nothing left to ship = refunded in full / voided payment, or every item removed from the order: not SLA workload
@@ -1485,7 +1485,7 @@ const slaDayKey = iso => sastDate(iso).toISOString().slice(0, 10);
 function slaDueEnd(createdIso, days = SLA_WORKING_DAYS) {   // end of the 2nd (or, for the buffer, 3rd) working day after the day the order was placed
   const d = sastDate(createdIso);
   let n = 0;
-  while (n < days) { d.setUTCDate(d.getUTCDate() + 1); if (d.getUTCDay() !== 0) n++; }
+  while (n < days) { d.setUTCDate(d.getUTCDate() + 1); if (d.getUTCDay() !== 0 && d.getUTCDay() !== 6) n++; }   // working days are Mon–Fri
   d.setUTCHours(23, 59, 59, 999);
   return new Date(d.getTime() - SAST_MS);
 }
@@ -1732,7 +1732,7 @@ function openSlaList(title, xs) {
 function renderTracker(main) {
   main.append(h('div', { class:'page-head' },
     h('div', null, h('div', { class:'page-title' }, 'Tracker'),
-      h('div', { class:'page-sub' }, `Every online order against the 2-working-day SLA (Mon–Sat, Sundays don’t count). An order is out when its first parcel is manifested in Shopify. Target: ${SLA_TARGET}% of each day’s orders out in time.`)),
+      h('div', { class:'page-sub' }, `Every online order against the 2-working-day SLA (Mon–Fri, weekends don’t count). An order is out when its first parcel is manifested in Shopify. Target: ${SLA_TARGET}% of each day’s orders out in time.`)),
     h('div', { class:'page-actions' }, h('button', { class:'btn', onclick: async e => {
       e.target.disabled = true; e.target.textContent = 'Pulling…';
       try {
