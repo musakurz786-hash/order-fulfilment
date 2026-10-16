@@ -1825,6 +1825,31 @@ function renderTracker(main) {
   const openDay = day => openSlaList(bucketLabel(day, gran), days[day]);
   if (daysAsc.length) main.append(slaCharts(daysAsc, openDay, gran));
 
+  // Month by month: the whole year side by side (follows the Shipment slicer, ignores the period); click a month for its orders
+  const byMonth = {};
+  for (const x of withSt) (byMonth[x.day.slice(0, 7)] ||= []).push(x);
+  const sumOf = xs => {
+    const sg = k => xs.filter(x => slaStage(x.o) === k).length;
+    const m = sg('met'), b = sg('buf'), l3 = sg('late3') + sg('over3'), bo = sg('bufopen');
+    const miss = xs.filter(x => x.st === 'late' || x.st === 'overdue').length, op = xs.filter(x => x.st === 'open').length;
+    return { xs, total: xs.length, m, b, bo, l3, miss, op,
+      p: m + miss ? Math.round(100 * m / (m + miss)) : null, p3: m + b + l3 ? Math.round(100 * (m + b) / (m + b + l3)) : null };
+  };
+  const pctBadge = (p, openN) => p == null ? h('span', { class:'muted sm' }, '–')
+    : h('span', { class:'badge ' + (p >= SLA_TARGET ? 'b-sent' : openN ? 'b-wait' : 'b-bad'), title: openN ? `${openN} still open – can still improve` : 'Final' }, `${p}%${openN ? ' so far' : ''}`);
+  const monthRows = Object.keys(byMonth).sort().map(k => ({ k, ...sumOf(byMonth[k]) }));
+  const yearRow = sumOf(withSt);
+  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Month by month', h('span', { class:'count' }, monthRows.length)),
+    h('p', { class:'muted sm' }, `The whole year side by side, for the Shipment choice above. “Inside 2 days” is the SLA (target ${SLA_TARGET}%); “Inside 3 days” includes the day-3 buffer. Click a month for its orders.`))));
+  const mt = h('table', { class:'plain' }, h('tr', null, ...['Month','Placed','Out in SLA','Out on day 3','Later / overdue','Open','Inside 2 days','Inside 3 days'].map(t => h('th', null, t))));
+  const mRow = (label, r, onclick, cls) => h('tr', { class: cls || 'rowlink', onclick },
+    h('td', { class:'mono' }, label), h('td', { class:'mono' }, r.total.toLocaleString('en-ZA')), h('td', { class:'mono' }, String(r.m)),
+    h('td', { class:'mono' }, String(r.b)), h('td', { class:'mono', style: r.l3 ? 'color:var(--warn)' : null }, String(r.l3)),
+    h('td', { class:'mono' }, String(r.op + r.bo)), h('td', null, pctBadge(r.p, r.op + r.bo)), h('td', null, pctBadge(r.p3, r.bo)));
+  for (const r of monthRows) mt.append(mRow(monthName(r.k), r, () => openSlaList(monthName(r.k), r.xs)));
+  mt.append(mRow('Year to date', yearRow, () => openSlaList('Year to date', yearRow.xs), 'rowlink total-row'));
+  main.append(h('div', { class:'card', style:'overflow-x:auto' }, mt));
+
   main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, gran === 'week' ? 'Week by week' : 'Day by day', h('span', { class:'count' }, daysAsc.length)),
     h('p', { class:'muted sm' }, `Orders by the ${unitName.toLowerCase()} they were placed${gran === 'week' ? ' (Monday to Sunday)' : ''}. “Missed” means the first parcel went out late, or still hasn’t and the 2 days are up. Click a ${unitName.toLowerCase()} for its orders.`))));
   const tbl = h('table', { class:'plain' }, h('tr', null, ...[unitName,'Placed','Out in SLA','Missed','Open, in time','SLA %'].map(t => h('th', null, t))));
