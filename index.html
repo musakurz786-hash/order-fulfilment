@@ -1642,6 +1642,66 @@ const partlyTag = o => isPartlyRefunded(o) ? h('span', { class:'ship-tag split',
 const isSplitOrder = o =>String(o.location_name || '').includes(',');
 const otherStores = o => String(o.location_name || '').split(',').map(s => s.trim()).filter(s => s && s !== hqLoc()).map(short).join(', ');
 
+// Order pop-up for the Tracker: what the Tracker already knows shows at once, then the live order (customer, address,
+// items, parcels, where it ships from) is read from Shopify. Read-only — nothing from here is saved.
+const money = m => m ? new Intl.NumberFormat('en-ZA', { style:'currency', currency: m.currencyCode || 'ZAR' }).format(Number(m.amount)) : '';
+function openOrderDetail(o, back) {
+  closeModal();
+  const stage = slaStage(o), [scls, slabel] = STAGE_CELL[stage];
+  const due2 = slaDueEnd(o.created_at), due3 = slaDueEnd(o.created_at, SLA_BUFFER_DAYS);
+  const dueTxt = d => d.toLocaleDateString('en-ZA', { weekday:'short', day:'numeric', month:'short' });
+  const fact = (k, v) => v ? h('div', { class:'fact' }, h('div', { class:'fact-l' }, k), h('div', { class:'fact-v lower' }, v)) : null;
+  const body = h('div', { class:'modal-body' }, h('div', { class:'muted' }, 'Loading the order from Shopify…'));
+  const copyBtn = h('button', { class:'btn sm', style:'display:none' }, 'Copy customer details');
+  const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
+    h('div', { class:'modal wide-modal', role:'dialog', 'aria-modal':'true', 'aria-label':'Order ' + o.order_name },
+      h('div', { class:'modal-head' }, h('div', { class:'card-title' }, o.order_name),
+        h('span', { class:'badge ' + scls }, slabel), partlyTag(o), copyBtn,
+        h('span', { style:'margin-left:auto' }),
+        back ? h('button', { class:'btn sm ghost', onclick: back }, '← Back to list') : null,
+        h('button', { class:'btn sm ghost', onclick: closeModal }, 'Close')),
+      body));
+  document.getElementById('modalRoot').append(bg);
+
+  const render = ord => {
+    const a = ord.ship || {};
+    const addr = [a.company, a.address1, a.address2, [a.city, a.zip].filter(Boolean).join(' '), a.province].filter(Boolean);
+    const email = ord.email || o.customer_email, name = a.name || o.customer_name, phone = a.phone || ord.phone;
+    const lineState = l => l.current === 0 ? ['b-bad', 'Refunded / removed'] : l.unfulfilled === 0 ? ['b-sent', 'Fulfilled'] : ['b-wait', l.unfulfilled < l.current ? `${l.current - l.unfulfilled} of ${l.current} fulfilled` : 'Not shipped'];
+    const items = h('table', { class:'plain' }, h('tr', null, ...['Item','SKU','Qty','Status'].map(t => h('th', null, t))),
+      ...ord.lines.map(l => { const [c, t] = lineState(l); return h('tr', null, h('td', null, l.name || ''), h('td', { class:'mono' }, l.sku || ''), h('td', { class:'mono' }, String(l.current ?? l.quantity)), h('td', null, h('span', { class:'badge ' + c }, t))); }));
+    const parcels = ord.parcels.length
+      ? h('div', null, ...ord.parcels.map(p => h('div', { class:'sm' }, `${when(p.at)} · ${p.status.toLowerCase()}`,
+          ...p.tracking.map(t => [' · ', t.url ? h('a', { href: t.url, target:'_blank', rel:'noopener' }, (t.company ? t.company + ' ' : '') + t.number) : (t.company ? t.company + ' ' : '') + t.number]).flat())))
+      : h('div', { class:'muted sm' }, 'No parcel manifested yet.');
+    body.replaceChildren(
+      h('div', { class:'facts' },
+        fact('Customer', name), fact('Email', email ? h('a', { href:'mailto:' + email }, email) : ''), fact('Phone', phone),
+        fact('Ship to', addr.length ? h('span', { style:'white-space:pre-line' }, addr.join('\n')) : ''),
+        fact('Placed', when(ord.created_at)),
+        fact('SLA', `2 days: ${dueTxt(due2)} · 3 days (buffer): ${dueTxt(due3)}`),
+        fact('Shopify', (ord.fulfillment_status || '').toLowerCase().replace(/_/g, ' ')),
+        fact('Payment', [(ord.financial_status || '').toLowerCase().replace(/_/g, ' '), money(ord.total)].filter(Boolean).join(' · ')),
+        fact('Delivery', ord.shipping_method),
+        fact('Ships from', ord.locations.map(n => n === hqLoc() ? 'HQ (' + n + ')' : short(n)).join(' + ')),
+        ord.refunds.length ? fact('Refunds', ord.refunds.map(r => when(r.at)).join(', ')) : null,
+        fact('Order note', ord.note)),
+      h('h3', { class:'sub-h' }, 'Items'), h('div', { class:'card', style:'overflow-x:auto' }, items),
+      h('h3', { class:'sub-h' }, 'Parcels'), parcels,
+      h('div', { class:'muted sm', style:'margin-top:10px' }, 'Short-picked items on this order are on ',
+        h('a', { href:'#' + o.order_name, onclick: e => { e.preventDefault(); closeModal(); S.view = 'lookup'; S.query = o.order_name; render(); } }, 'Order lookup'), '.'));
+    copyBtn.style.display = '';
+    copyBtn.onclick = () => navigator.clipboard.writeText([name, email, phone, ...addr].filter(Boolean).join('\n')).then(() => toast('Customer details copied'));
+  };
+  callSync({ view: o.order_name }).then(r => render(r.order)).catch(e => {
+    body.replaceChildren(h('div', { class:'warn' }, 'Couldn’t load the order from Shopify: ' + e.message),
+      h('div', { class:'facts' }, fact('Customer', o.customer_name), fact('Email', o.customer_email), fact('Placed', when(o.created_at)),
+        fact('Shopify', (o.fulfillment_status || '').toLowerCase().replace(/_/g, ' ')), fact('Payment', (o.financial_status || '').toLowerCase().replace(/_/g, ' '))));
+  });
+}
+// An order number in a Tracker list: opens the order pop-up (back returns to the list it came from)
+const orderLinkEl = (o, back) => h('a', { href:'#' + o.order_name, title:'Open the order', onclick: e => { e.preventDefault(); openOrderDetail(o, back); } }, o.order_name);
+
 // Drill-down: a list of orders in full (a day, or a tile's group), oldest first
 function openSlaList(title, xs) {
   closeModal();
@@ -1651,7 +1711,7 @@ function openSlaList(title, xs) {
   for (const x of sorted.slice(0, 400)) {
     const [cls, label] = STAGE_CELL[slaStage(x.o)];
     tbl.append(h('tr', null,
-      h('td', { class:'mono' }, h('a', { href:'#' + x.o.order_name, onclick: e => { e.preventDefault(); closeModal(); S.view = 'lookup'; S.query = x.o.order_name; render(); } }, x.o.order_name)),
+      h('td', { class:'mono' }, orderLinkEl(x.o, () => openSlaList(title, xs))),
       h('td', { title: x.o.customer_email || null }, x.o.customer_name || ''),
       h('td', { class:'mono' }, when(x.o.created_at)),
       h('td', { class:'mono' }, x.o.first_fulfilled_at ? when(x.o.first_fulfilled_at) : '—'),
@@ -1812,7 +1872,7 @@ function renderTracker(main) {
   const bt = h('table', { class:'plain' }, h('tr', null, ...['SLA','Order','Customer','Placed','Shipment','Payment','Shopify'].map(t => h('th', null, t))));
   for (const x of shown.slice(0, 200)) bt.append(h('tr', null,
     h('td', null, dueCell(x)),
-    h('td', { class:'mono' }, h('a', { href:'#' + x.o.order_name, onclick: e => { e.preventDefault(); S.view = 'lookup'; S.query = x.o.order_name; render(); } }, x.o.order_name)),
+    h('td', { class:'mono' }, orderLinkEl(x.o)),
     h('td', { title: x.o.customer_email || null }, x.o.customer_name || ''),
     h('td', { class:'mono' }, when(x.o.created_at)),
     h('td', null, isSplitOrder(x.o) ? h('span', { class:'ship-tag split' }, 'Split · ' + otherStores(x.o)) : 'HQ only'),
