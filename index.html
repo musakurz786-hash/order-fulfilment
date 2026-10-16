@@ -1411,7 +1411,8 @@ function renderLookup(main) {
 
 // Refund sheet: items no store could supply, marked for refund. "Refunded" comes from Shopify (the item's current
 // quantity drops to 0 once it's refunded there), picked up by the 20-minute sync.
-const refundLines = () => S.lines.filter(l => l.state === 'refund');
+const REFUND_KEEP_DAYS = 7;
+const refundLines = () =>S.lines.filter(l => l.state === 'refund');
 // Refunded: Shopify shows it (current quantity 0), or someone ticked it as done on the refund sheet
 const isRefunded = l => l.shopify_current === 0 || !!l.refund_done_at;
 function refundMarkedAt(l) {
@@ -1455,9 +1456,11 @@ function renderRefunds(main) {
 
   // Has been refunded: newest first
   const doneAt = l => l.refunded_at || l.refund_done_at || '';
-  const done = all.filter(isRefunded).sort((a, b) => String(doneAt(b)).localeCompare(String(doneAt(a))));
+  // A refunded item stays here for 7 days after it was refunded, then drops off the sheet (its order card keeps the history)
+  const done = all.filter(l => isRefunded(l) && (!doneAt(l) || ageHours(doneAt(l)) < REFUND_KEEP_DAYS * 24))
+    .sort((a, b) => String(doneAt(b)).localeCompare(String(doneAt(a))));
   main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Has been refunded', h('span', { class:'count' }, done.length)),
-    h('p', { class:'muted sm' }, `Done, last ${CONFIG.LOOKBACK_DAYS} days. “Shopify” means Shopify itself shows the refund; a name means that person ticked it off (Shopify usually confirms within 20 minutes).`))));
+    h('p', { class:'muted sm' }, `Done, kept for ${REFUND_KEEP_DAYS} days. “Shopify” means Shopify itself shows the refund; a name means that person ticked it off (Shopify usually confirms within 20 minutes).`))));
   if (!done.length) { main.append(h('div', { class:'empty' }, 'None yet.')); return; }
   const t2 = h('table', { class:'plain' }, h('tr', null, ...['Refunded','By','Marked','Order','Customer','SKU','Item','Qty','Note',''].map(t => h('th', null, t))));
   for (const [l, o, fin] of done.map(row)) t2.append(h('tr', null,
