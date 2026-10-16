@@ -1593,7 +1593,10 @@ function slaCharts(daysAsc, openDay, gran = 'day') {
 }
 
 // Orders assigned to HQ and a store at once are split shipments (HQ ships its part, a store ships the rest)
-const isSplitOrder = o => String(o.location_name || '').includes(',');
+// Partly refunded: part of the order was refunded but items are still on it — those still have to ship, so it stays in the SLA
+const isPartlyRefunded = o => o.financial_status === 'PARTIALLY_REFUNDED';
+const partlyTag = o => isPartlyRefunded(o) ? h('span', { class:'ship-tag split', title:'Part of this order was refunded; the items still on it have not shipped' }, 'Partly refunded · ' + (o.items_left ?? '?') + ' left') : null;
+const isSplitOrder = o =>String(o.location_name || '').includes(',');
 const otherStores = o => String(o.location_name || '').split(',').map(s => s.trim()).filter(s => s && s !== hqLoc()).map(short).join(', ');
 
 // Drill-down: a list of orders in full (a day, or a tile's group), oldest first
@@ -1612,9 +1615,9 @@ function openSlaList(title, xs) {
       h('td', { class:'mono' }, x.o.first_fulfilled_at ? when(x.o.first_fulfilled_at) : '—'),
       h('td', { class:'mono' }, x.o.first_fulfilled_at ? hText(hoursBetween(x.o.created_at, x.o.first_fulfilled_at)) : '—'),
       h('td', null, isSplitOrder(x.o) ? h('span', { class:'ship-tag split', title:'HQ ships part of this order; a store ships the rest' }, 'Split · ' + otherStores(x.o)) : 'HQ only'),
-      h('td', null, h('span', { class:'badge ' + cls }, label))));
+      h('td', null, h('span', { class:'badge ' + cls }, label), ' ', partlyTag(x.o))));
   }
-  const bg = h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
+  const bg =h('div', { class:'modal-bg', onclick: e => { if (e.target === bg) closeModal(); } },
     h('div', { class:'modal wide-modal', role:'dialog', 'aria-modal':'true', 'aria-label':title },
       h('div', { class:'modal-head' }, h('div', { class:'card-title' }, title),
         h('span', { class:'muted' }, `${xs.length} order${xs.length === 1 ? '' : 's'} · ${m} out in SLA · ${miss} missed · ${op} open`),
@@ -1744,16 +1747,25 @@ function renderTracker(main) {
       ? h('span', { class:'badge b-wait' }, 'Due today')
       : h('span', { class:'badge' }, 'Due ' + due.toLocaleDateString('en-ZA', { weekday:'short', day:'numeric', month:'short' }));
   };
-  const bt = h('table', { class:'plain' }, h('tr', null, ...['SLA','Order','Customer','Placed','Shipment','Shopify'].map(t => h('th', null, t))));
-  for (const x of backlog.slice(0, 200)) bt.append(h('tr', null,
+  // Slicer for this list: all open orders, or just the partly refunded ones (part refunded, items still to ship)
+  const nPartly = backlog.filter(x => isPartlyRefunded(x.o)).length;
+  const lf = T.backlog || 'all';
+  const backBtn = (v, text) => h('button', { 'aria-pressed': String(lf === v), onclick: () => { T.backlog = v; render(); } }, text);
+  main.append(h('div', { class:'slicers' }, h('div', { class:'slicer' }, h('span', { class:'slicer-l' }, 'Show'),
+    h('div', { class:'toggle', role:'group', 'aria-label':'Not yet out filter' }, backBtn('all', `All (${backlog.length})`), backBtn('partly', `Partly refunded (${nPartly})`)))));
+  const shown = lf === 'partly' ? backlog.filter(x => isPartlyRefunded(x.o)) : backlog;
+  if (!shown.length) { main.append(h('div', { class:'empty' }, 'No partly refunded orders waiting.')); return; }
+  const bt = h('table', { class:'plain' }, h('tr', null, ...['SLA','Order','Customer','Placed','Shipment','Payment','Shopify'].map(t => h('th', null, t))));
+  for (const x of shown.slice(0, 200)) bt.append(h('tr', null,
     h('td', null, dueCell(x)),
     h('td', { class:'mono' }, h('a', { href:'#' + x.o.order_name, onclick: e => { e.preventDefault(); S.view = 'lookup'; S.query = x.o.order_name; render(); } }, x.o.order_name)),
     h('td', { title: x.o.customer_email || null }, x.o.customer_name || ''),
     h('td', { class:'mono' }, when(x.o.created_at)),
     h('td', null, isSplitOrder(x.o) ? h('span', { class:'ship-tag split' }, 'Split · ' + otherStores(x.o)) : 'HQ only'),
+    h('td', null, partlyTag(x.o) || (x.o.financial_status || '').toLowerCase().replace(/_/g, ' ')),
     h('td', null, (x.o.fulfillment_status || '').toLowerCase().replace(/_/g, ' '))));
   main.append(h('div', { class:'card', style:'overflow-x:auto' }, bt));
-  if (backlog.length > 200) main.append(h('div', { class:'muted sm' }, `Showing the 200 most urgent of ${backlog.length}.`));
+  if (shown.length > 200) main.append(h('div', { class:'muted sm' }, `Showing the 200 most urgent of ${shown.length}.`));
 }
 
 // ---------- reports (admin) ----------
