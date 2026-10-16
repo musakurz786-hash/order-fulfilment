@@ -1482,10 +1482,10 @@ const nothingToShip = o => o.financial_status === 'REFUNDED' || o.financial_stat
 const slaOrders = () => (S.sla || []).filter(o => !o.cancelled_at && o.source_name === 'web' && !nothingToShip(o));
 const sastDate = iso => new Date(new Date(iso).getTime() + SAST_MS);   // read with getUTC* only
 const slaDayKey = iso => sastDate(iso).toISOString().slice(0, 10);
-function slaDueEnd(createdIso) {   // end of the 2nd working day after the day the order was placed
+function slaDueEnd(createdIso, days = SLA_WORKING_DAYS) {   // end of the 2nd (or, for the buffer, 3rd) working day after the day the order was placed
   const d = sastDate(createdIso);
   let n = 0;
-  while (n < SLA_WORKING_DAYS) { d.setUTCDate(d.getUTCDate() + 1); if (d.getUTCDay() !== 0) n++; }
+  while (n < days) { d.setUTCDate(d.getUTCDate() + 1); if (d.getUTCDay() !== 0) n++; }
   d.setUTCHours(23, 59, 59, 999);
   return new Date(d.getTime() - SAST_MS);
 }
@@ -1494,10 +1494,23 @@ function slaStatus(o) {
   if (o.first_fulfilled_at) return new Date(o.first_fulfilled_at) <= due ? 'met' : 'late';
   return Date.now() > due.getTime() ? 'overdue' : 'open';
 }
+// The 3rd working day is a buffer on top of the 2-day SLA: it isn't the promise, but it separates an order that is a
+// day late from one that is properly late. Stages follow one order's journey through both deadlines:
+//   met (out inside 2 days) → buf (out on day 3) → late3 (out after day 3)
+//   open (still inside 2 days) → bufopen (past the SLA, inside the buffer) → over3 (past day 3, still not out)
+const SLA_BUFFER_DAYS = SLA_WORKING_DAYS + 1;
+function slaStage(o) {
+  const d2 = slaDueEnd(o.created_at), d3 = slaDueEnd(o.created_at, SLA_BUFFER_DAYS);
+  if (o.first_fulfilled_at) { const t = new Date(o.first_fulfilled_at); return t <= d2 ? 'met' : t <= d3 ? 'buf' : 'late3'; }
+  const now = Date.now();
+  return now <= d2.getTime() ? 'open' : now <= d3.getTime() ? 'bufopen' : 'over3';
+}
+const STAGE_CELL = { met:['b-sent', 'Out in time'], buf:['b-wait', 'Out on day 3'], late3:['b-bad', 'Out late'],
+  open:['b-wait', 'Open'], bufopen:['b-wait', 'Past SLA · in buffer'], over3:['b-bad', 'Overdue'] };
 // Tracker charts: hand-rolled SVG on the app's dark tiles. Fills are a validated chart palette (the badge
 // colours are too light and too close for colour-blind readers); "missed" is also hatched so colour never
 // carries it alone. met green / missed red / open blue, in that fixed stack order.
-const VIZ = { met:'#199e70', miss:'#d03b3b', open:'#3987e5', grid:'#262626', axis:'#6b6b6b' };
+const VIZ = { met:'#199e70', buf:'#d9962b', miss:'#d03b3b', open:'#3987e5', grid:'#262626', axis:'#6b6b6b' };
 const sv = (tag, attrs, ...kids) => {
   const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
   for (const [k, v] of Object.entries(attrs || {})) { if (v == null) continue; k.startsWith('on') ? e.addEventListener(k.slice(2), v) : e.setAttribute(k, v); }
@@ -1539,7 +1552,9 @@ function slaCharts(daysAsc, openDay, gran = 'day') {
 
   // Chart 1: each day's orders, stacked by outcome (met + missed + open = placed)
   const defs = sv('defs', null, sv('pattern', { id:'slaHatch', patternUnits:'userSpaceOnUse', width:'5', height:'5', patternTransform:'rotate(45)' },
-    sv('rect', { width:'5', height:'5', fill: VIZ.miss }), sv('line', { x1:'0', y1:'0', x2:'0', y2:'5', stroke:'rgba(10,10,10,.5)', 'stroke-width':'2' })));
+    sv('rect', { width:'5', height:'5', fill: VIZ.miss }), sv('line', { x1:'0', y1:'0', x2:'0', y2:'5', stroke:'rgba(10,10,10,.5)', 'stroke-width':'2' })),
+    sv('pattern', { id:'slaHatchBuf', patternUnits:'userSpaceOnUse', width:'5', height:'5', patternTransform:'rotate(45)' },
+      sv('rect', { width:'5', height:'5', fill: VIZ.buf }), sv('line', { x1:'0', y1:'0', x2:'0', y2:'5', stroke:'rgba(10,10,10,.5)', 'stroke-width':'2' })));
   const bars = sv('svg', { viewBox:`0 0 ${W} ${H}`, role:'img', 'aria-label':'Orders per ' + unit + ' by outcome' }, defs);
   for (let g = 0; g <= 4; g++) {
     const gy = y(g * yTick);
@@ -1548,9 +1563,10 @@ function slaCharts(daysAsc, openDay, gran = 'day') {
   }
   daysAsc.forEach((d, i) => {
     const x0 = xc(i) - bw / 2;
-    const tip = `${bucketLabel(d.day, gran)} — ${d.total} placed\nOut in SLA ${d.m} · Missed ${d.miss} · Open ${d.op}`;
+    const tip = `${bucketLabel(d.day, gran)} — ${d.total} placed\nOut in SLA ${d.m} · Out on day 3 ${d.b} · Past SLA, in buffer ${d.bo} · Later than day 3 ${d.l3} · Open ${d.op}`;
     const hover = { class:'bar', onmouseenter: e => tipShow(e, tip), onmousemove: tipMove, onmouseleave: tipHide, onclick: () => openDay(d.day) };
-    const segs = [[d.m, VIZ.met], [d.miss, 'url(#slaHatch)'], [d.op, VIZ.open]].filter(s => s[0] > 0);
+    // Stack order follows an order's journey: in SLA → buffer (out / still open) → properly late → open and on time
+    const segs = [[d.m, VIZ.met], [d.b, VIZ.buf], [d.bo, 'url(#slaHatchBuf)'], [d.l3, 'url(#slaHatch)'], [d.op, VIZ.open]].filter(s => s[0] > 0);
     let acc = 0;
     segs.forEach(([v, fill], si) => {
       const yTopSeg = y(acc + v), hgt = Math.max(1.5, y(acc) - y(acc + v) - (si < segs.length - 1 ? 2 : 0));
@@ -1561,10 +1577,10 @@ function slaCharts(daysAsc, openDay, gran = 'day') {
     if (i % every === 0) bars.append(sv('text', { x: xc(i), y: H - 8, 'text-anchor':'middle', 'font-size':'9', fill: VIZ.axis },
       axisLabel(d.day, gran)));
   });
-  const chip = (c, label, hatch) => h('span', null, h('i', { style:`background:${hatch ? 'repeating-linear-gradient(45deg,' + VIZ.miss + ' 0 3px, rgba(10,10,10,.5) 3px 5px)' : c}` }), label);
+  const chip = (c, label, hatch) => h('span', null, h('i', { style:`background:${hatch ? 'repeating-linear-gradient(45deg,' + hatch + ' 0 3px, rgba(10,10,10,.5) 3px 5px)' : c}` }), label);
   const c1 = h('div', { class:'chart' },
-    h('div', null, h('div', { class:'chart-title' }, `Orders per ${unit}`), h('div', { class:'dim xs' }, `Click a bar for that ${unit}’s orders.`)),
-    h('div', { class:'legend' }, chip(VIZ.met, 'Out in SLA'), chip(VIZ.miss, 'Missed', true), chip(VIZ.open, 'Still open')),
+    h('div', null, h('div', { class:'chart-title' }, `Orders per ${unit}`), h('div', { class:'dim xs' }, `Each order's journey: in SLA, then the 3rd-day buffer, then properly late. Click a bar for that ${unit}’s orders.`)),
+    h('div', { class:'legend' }, chip(VIZ.met, 'Out in SLA (2 days)'), chip(VIZ.buf, 'Out on day 3'), chip(null, 'Past SLA, in buffer', VIZ.buf), chip(null, 'Later than day 3', VIZ.miss), chip(VIZ.open, 'Open, on time')),
     bars);
 
   // Chart 2: the day's SLA % (single series) against the SLA target
@@ -1577,17 +1593,31 @@ function slaCharts(daysAsc, openDay, gran = 'day') {
   }
   line.append(sv('line', { x1: P.l, x2: W - P.r, y1: y2(SLA_TARGET), y2: y2(SLA_TARGET), stroke: VIZ.axis, 'stroke-width': 1, 'stroke-dasharray':'5 4' }));
   line.append(sv('text', { x: W - P.r, y: y2(SLA_TARGET) - 4, 'text-anchor':'end', 'font-size':'9', fill: VIZ.axis }, `Target ${SLA_TARGET}%`));
-  if (pts.length > 1) line.append(sv('polyline', { points: pts.map(d => `${xc(d.i)},${y2(d.p)}`).join(' '), fill:'none', stroke: VIZ.open, 'stroke-width': 2, 'stroke-linejoin':'round', 'stroke-linecap':'round' }));
-  pts.forEach((d, k) => {
-    const tip = `${bucketLabel(d.day, gran)} — ${d.p}%${d.op ? ' so far' : ''} (${d.m} of ${d.m + d.miss} decided)`;
-    line.append(sv('circle', { cx: xc(d.i), cy: y2(d.p), r: 3.5, fill: d.op ? 'var(--tile)' : VIZ.open, stroke: VIZ.open, 'stroke-width': 2 }));
-    line.append(sv('circle', { cx: xc(d.i), cy: y2(d.p), r: 10, fill:'transparent', class:'bar',
+  // Two lines that belong together: % out inside 2 days (the SLA) and % out inside 3 days (with the buffer).
+  // The 3-day line can never sit below the 2-day line; the shaded band between them is what the buffer saves.
+  const both = pts.filter(d => d.p3 != null);
+  if (both.length > 1) line.append(sv('polygon', { fill: VIZ.buf, 'fill-opacity': '.18', stroke:'none',
+    points: [...both.map(d => `${xc(d.i)},${y2(d.p3)}`), ...[...both].reverse().map(d => `${xc(d.i)},${y2(d.p)}`)].join(' ') }));
+  const draw = (key, color, dash) => {
+    const ps = pts.filter(d => d[key] != null);
+    if (ps.length > 1) line.append(sv('polyline', { points: ps.map(d => `${xc(d.i)},${y2(d[key])}`).join(' '), fill:'none', stroke: color, 'stroke-width': 2, 'stroke-linejoin':'round', 'stroke-linecap':'round', 'stroke-dasharray': dash || null }));
+    ps.forEach((d, k) => {
+      line.append(sv('circle', { cx: xc(d.i), cy: y2(d[key]), r: 3.5, fill: d.op || d.bo ? 'var(--tile)' : color, stroke: color, 'stroke-width': 2 }));
+      if (k === ps.length - 1) line.append(sv('text', { x: xc(d.i) - 6, y: y2(d[key]) + (key === 'p3' ? -8 : 15), 'text-anchor':'end', 'font-size':'10', 'font-weight':'600', fill:'#fafafa' }, d[key] + '%'));
+    });
+  };
+  draw('p3', VIZ.buf, '5 3');
+  draw('p', VIZ.open);
+  pts.forEach(d => {
+    const tip = `${bucketLabel(d.day, gran)}\nInside 2 days (SLA): ${d.p}%${d.op ? ' so far' : ''}\nInside 3 days (buffer): ${d.p3 == null ? '–' : d.p3 + '%'}${d.bo ? ` · ${d.bo} still in the buffer` : ''}`;
+    line.append(sv('rect', { x: xc(d.i) - step / 2, y: P.t, width: step, height: ih, fill:'transparent', class:'bar',
       onmouseenter: e => tipShow(e, tip), onmousemove: tipMove, onmouseleave: tipHide, onclick: () => openDay(d.day) }));
-    if (k === pts.length - 1) line.append(sv('text', { x: xc(d.i), y: y2(d.p) - 8, 'text-anchor':'middle', 'font-size':'10', 'font-weight':'600', fill:'#fafafa' }, d.p + '%'));
   });
   daysAsc.forEach((d, i) => { if (i % every === 0) line.append(sv('text', { x: xc(i), y: H - 8, 'text-anchor':'middle', 'font-size':'9', fill: VIZ.axis }, axisLabel(d.day, gran))); });
   const c2 = h('div', { class:'chart' },
-    h('div', null, h('div', { class:'chart-title' }, `Out within SLA, ${unit} by ${unit} (%)`), h('div', { class:'dim xs' }, `Hollow points: some of that ${unit}’s orders are still open, so the % can change.`)),
+    h('div', null, h('div', { class:'chart-title' }, `Out on time, ${unit} by ${unit} (%): 2-day SLA and 3-day buffer`),
+      h('div', { class:'dim xs' }, `Solid blue = out inside 2 days. Dashed amber = out inside 3 days; the shaded gap is the buffer. Hollow points can still change while orders are open.`)),
+    h('div', { class:'legend' }, chip(VIZ.open, 'Inside 2 days'), chip(VIZ.buf, 'Inside 3 days')),
     line);
   return h('div', { class:'charts' }, c1, c2);
 }
@@ -1604,10 +1634,9 @@ function openSlaList(title, xs) {
   closeModal();
   const sorted = [...xs].sort((a, b) => String(a.o.created_at).localeCompare(String(b.o.created_at)));
   const m = xs.filter(x => x.st === 'met').length, miss = xs.filter(x => x.st === 'late' || x.st === 'overdue').length, op = xs.filter(x => x.st === 'open').length;
-  const SLA_CELL = { met: ['b-sent', 'Out in time'], late: ['b-bad', 'Out late'], overdue: ['b-bad', 'Overdue'], open: ['b-wait', 'Open'] };
   const tbl = h('table', { class:'plain' }, h('tr', null, ...['Order','Customer','Placed','First parcel out','Took','Shipment','SLA'].map(t => h('th', null, t))));
   for (const x of sorted.slice(0, 400)) {
-    const [cls, label] = SLA_CELL[x.st];
+    const [cls, label] = STAGE_CELL[slaStage(x.o)];
     tbl.append(h('tr', null,
       h('td', { class:'mono' }, h('a', { href:'#' + x.o.order_name, onclick: e => { e.preventDefault(); closeModal(); S.view = 'lookup'; S.query = x.o.order_name; render(); } }, x.o.order_name)),
       h('td', { title: x.o.customer_email || null }, x.o.customer_name || ''),
@@ -1713,7 +1742,12 @@ function renderTracker(main) {
     const m = xs.filter(x => x.st === 'met').length;
     const miss = xs.filter(x => x.st === 'late' || x.st === 'overdue').length;
     const op = xs.filter(x => x.st === 'open').length;
-    return { day, m, miss, op, total: xs.length, p: m + miss ? Math.round(100 * m / (m + miss)) : null };
+    // The same orders through the 3-day buffer: out on day 3, past SLA but still inside the buffer, or beyond it
+    const sg = k => xs.filter(x => slaStage(x.o) === k).length;
+    const b = sg('buf'), bo = sg('bufopen'), l3 = sg('late3') + sg('over3');
+    // p = % out inside 2 days; p3 = % out inside 3 days (orders still in their buffer aren't counted either way yet)
+    return { day, m, miss, op, b, bo, l3, total: xs.length, p: m + miss ? Math.round(100 * m / (m + miss)) : null,
+      p3: m + b + l3 ? Math.round(100 * (m + b) / (m + b + l3)) : null };
   });
   const openDay = day => openSlaList(bucketLabel(day, gran), days[day]);
   if (daysAsc.length) main.append(slaCharts(daysAsc, openDay, gran));
@@ -1742,19 +1776,26 @@ function renderTracker(main) {
   if (!backlog.length) { main.append(h('div', { class:'empty' }, 'Everything has gone out.')); return; }
   const dueCell = x => {
     const due = slaDueEnd(x.o.created_at);
-    if (x.st === 'overdue') return h('span', { class:'badge b-bad' }, `Overdue ${ageText(due.toISOString())}`);
+    if (x.st === 'overdue') return slaStage(x.o) === 'bufopen'
+      ? h('span', { class:'badge b-wait', title:'Past the 2-day SLA, still inside the 3rd-day buffer' }, `Past SLA ${ageText(due.toISOString())} · in buffer`)
+      : h('span', { class:'badge b-bad' }, `Overdue ${ageText(due.toISOString())}`);
     return slaDayKey(due.toISOString()) === slaDayKey(new Date().toISOString())
       ? h('span', { class:'badge b-wait' }, 'Due today')
       : h('span', { class:'badge' }, 'Due ' + due.toLocaleDateString('en-ZA', { weekday:'short', day:'numeric', month:'short' }));
   };
   // Slicer for this list: all open orders, or just the partly refunded ones (part refunded, items still to ship)
+  // Inside SLA = still within its 2 working days; outside = already past them (some of those are still inside the 3-day buffer)
+  const inside = backlog.filter(x => x.st === 'open'), outside = backlog.filter(x => x.st === 'overdue');
+  const inBuffer = outside.filter(x => slaStage(x.o) === 'bufopen').length;
   const nPartly = backlog.filter(x => isPartlyRefunded(x.o)).length;
   const lf = T.backlog || 'all';
   const backBtn = (v, text) => h('button', { 'aria-pressed': String(lf === v), onclick: () => { T.backlog = v; render(); } }, text);
   main.append(h('div', { class:'slicers' }, h('div', { class:'slicer' }, h('span', { class:'slicer-l' }, 'Show'),
-    h('div', { class:'toggle', role:'group', 'aria-label':'Not yet out filter' }, backBtn('all', `All (${backlog.length})`), backBtn('partly', `Partly refunded (${nPartly})`)))));
-  const shown = lf === 'partly' ? backlog.filter(x => isPartlyRefunded(x.o)) : backlog;
-  if (!shown.length) { main.append(h('div', { class:'empty' }, 'No partly refunded orders waiting.')); return; }
+    h('div', { class:'toggle', role:'group', 'aria-label':'Not yet out filter' }, backBtn('all', `All (${backlog.length})`),
+      backBtn('inside', `Inside SLA (${inside.length})`), backBtn('outside', `Outside SLA (${outside.length})`), backBtn('partly', `Partly refunded (${nPartly})`))),
+    outside.length ? h('span', { class:'muted sm' }, `${inBuffer} of the ${outside.length} outside SLA are still inside the 3-day buffer; ${outside.length - inBuffer} are past it.`) : null));
+  const shown = lf === 'partly' ? backlog.filter(x => isPartlyRefunded(x.o)) : lf === 'inside' ? inside : lf === 'outside' ? outside : backlog;
+  if (!shown.length) { main.append(h('div', { class:'empty' }, 'Nothing in this view.')); return; }
   const bt = h('table', { class:'plain' }, h('tr', null, ...['SLA','Order','Customer','Placed','Shipment','Payment','Shopify'].map(t => h('th', null, t))));
   for (const x of shown.slice(0, 200)) bt.append(h('tr', null,
     h('td', null, dueCell(x)),
