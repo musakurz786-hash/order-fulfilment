@@ -1414,7 +1414,9 @@ function renderLookup(main) {
 const REFUND_KEEP_DAYS = 7;
 const refundLines = () =>S.lines.filter(l => l.state === 'refund');
 // Refunded: Shopify shows it (current quantity 0), or someone ticked it as done on the refund sheet
-const isRefunded = l => l.shopify_current === 0 || !!l.refund_done_at;
+// Shopify's side: as many units refunded as were marked (so "ordered 2, refunded 1" counts only when 1 was marked) — worked out in the database
+const shopifyRefunded = l => l.shopify_refunded ?? l.shopify_current === 0;
+const isRefunded = l => shopifyRefunded(l) || !!l.refund_done_at;
 function refundMarkedAt(l) {
   const ev = S.events.filter(e => e.line_id === l.id && e.kind === 'refund').map(e => e.at).sort().pop();
   return ev || l.updated_at || l.added_at;
@@ -1465,11 +1467,11 @@ function renderRefunds(main) {
   const t2 = h('table', { class:'plain' }, h('tr', null, ...['Refunded','By','Marked','Order','Customer','SKU','Item','Qty','Note',''].map(t => h('th', null, t))));
   for (const [l, o, fin] of done.map(row)) t2.append(h('tr', null,
     h('td', null, h('span', { class:'badge b-sent', title: fin }, doneAt(l) ? when(doneAt(l)) : 'Refunded')),
-    h('td', null, l.shopify_current === 0 ? 'Shopify' : nameOf(l.refund_done_by)),
+    h('td', null, shopifyRefunded(l) ? 'Shopify' : nameOf(l.refund_done_by)),
     h('td', { class:'mono' }, when(refundMarkedAt(l))), orderCell(l),
     h('td', null, o.customer_name || ''), h('td', { class:'mono' }, l.sku), h('td', null, l.item_name || ''), h('td', { class:'mono' }, String(l.qty)),
     h('td', null, l.note || ''),
-    h('td', null, canEmail() && l.shopify_current !== 0 ? h('button', { class:'btn ghost sm', title:'Ticked by mistake? Put it back on the to-be-refunded list', onclick: () => setDone(l, false) }, 'Untick') : null)));
+    h('td', null, canEmail() && !shopifyRefunded(l) ? h('button', { class:'btn ghost sm', title:'Ticked by mistake? Put it back on the to-be-refunded list', onclick: () => setDone(l, false) }, 'Untick') : null)));
   main.append(h('div', { class:'card', style:'overflow-x:auto' }, t2));
 }
 
