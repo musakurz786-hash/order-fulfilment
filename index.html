@@ -1539,7 +1539,90 @@ const topRect = (x, y, w, hgt, fill, rounded, extra) => {
   return sv('path', { d:`M${x},${y + hgt} V${y + r} Q${x},${y} ${x + r},${y} H${x + w - r} Q${x + w},${y} ${x + w},${y + r} V${y + hgt} Z`, fill, ...(extra || {}) });
 };
 
+// ---- Composed chart (bars + lines), drawn with Apache ECharts — the engine behind the EvilCharts "composed chart" ----
+// ECharts is loaded on first use. If it can't load (offline, blocked), the hand-drawn SVG charts below are shown instead.
+let echartsLoad = null;
+const loadEcharts = () => echartsLoad ||= new Promise((res, rej) => {
+  if (window.echarts) return res(window.echarts);
+  const s = document.createElement('script');
+  s.src = 'https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js';
+  s.onload = () => res(window.echarts);
+  s.onerror = () => { echartsLoad = null; rej(new Error('ECharts failed to load')); };
+  document.head.append(s);
+});
+let slaChartLive = null;   // the chart currently on screen (disposed when the Tracker redraws)
 function slaCharts(daysAsc, openDay, gran = 'day') {
+  const unit = gran === 'week' ? 'week' : 'day';
+  const mount = h('div', { style:'height:400px;width:100%' }, h('div', { class:'muted sm' }, 'Loading the chart…'));
+  const wrap = h('div', { class:'charts', style:'grid-template-columns:minmax(0,1fr)' },
+    h('div', { class:'chart' },
+      h('div', null, h('div', { class:'chart-title' }, `Orders and SLA, ${unit} by ${unit}`),
+        h('div', { class:'dim xs' }, `Bars: each ${unit}'s orders by journey (in SLA → day-3 buffer → later → open). Lines: % out inside 2 days (SLA, target ${SLA_TARGET}%) and inside 3 days; the shaded gap is the buffer. Click a ${unit} for its orders; click a legend name to hide or show it.`)),
+      mount));
+  loadEcharts().then(ec => {
+    if (!mount.isConnected) return;   // the Tracker redrew while the library loaded
+    slaChartLive?.dispose(); slaChartLive?.__ro?.disconnect();
+    mount.replaceChildren();
+    const chart = ec.init(mount, null, { renderer:'canvas' });
+    slaChartLive = chart;
+    const cats = daysAsc.map(d => axisLabel(d.day, gran));
+    const lowest = Math.min(SLA_TARGET, ...daysAsc.filter(d => d.p != null).map(d => d.p), ...daysAsc.filter(d => d.p3 != null).map(d => d.p3));
+    const lo = Math.max(0, Math.min(80, Math.floor((lowest - 4) / 20) * 20));
+    const AX = '#8a8a8a', GRID = 'rgba(255,255,255,.07)', LINE2 = '#f4f4f5';
+    const decal = c => ({ symbol:'rect', symbolSize:1, rotation: Math.PI / 4, dashArrayX:[1, 0], dashArrayY:[2, 3], color:c });
+    const grad = c => new ec.graphic.LinearGradient(0, 0, 0, 1, [{ offset:0, color:c }, { offset:1, color:c + 'b3' }]);
+    const bar = (name, key, c, hatch) => ({ name, type:'bar', stack:'orders', yAxisIndex:0, barMaxWidth:34, data: daysAsc.map(d => d[key]),
+      itemStyle:{ color: grad(c), borderRadius:[2, 2, 0, 0], ...(hatch ? { decal: decal('rgba(10,10,10,.55)') } : {}) },
+      emphasis:{ focus:'series' }, animationDelay: i => i * 18 });
+    const pct = (name, key, color, dash) => ({ name, type:'line', yAxisIndex:1, z:10, data: daysAsc.map(d => d[key] == null ? null : ({ value:d[key],
+        // hollow point = some of that bucket's orders are still open, so the % can still change
+        itemStyle: d.op || d.bo ? { color:'#171717', borderColor:color, borderWidth:2 } : { color, borderColor:color, borderWidth:2 } })),
+      symbol:'circle', symbolSize:7, connectNulls:false,
+      lineStyle:{ color, width:2.5, type: dash ? 'dashed' : 'solid', shadowColor: color, shadowBlur:8 }, itemStyle:{ color },
+      emphasis:{ focus:'series' }, animationDelay: i => 300 + i * 18,
+      ...(key === 'p' ? { markLine:{ silent:true, symbol:'none', animation:false, lineStyle:{ color:AX, type:'dashed', width:1 },
+        label:{ formatter:`Target ${SLA_TARGET}%`, color:AX, fontSize:10, position:'insideEndTop' }, data:[{ yAxis: SLA_TARGET }] } } : {}) });
+    // The buffer band: the area between the 3-day and 2-day lines (stacked: invisible 2-day base + visible difference)
+    const base = { name:'_base', type:'line', yAxisIndex:1, stack:'band', symbol:'none', silent:true, tooltip:{ show:false },
+      lineStyle:{ opacity:0 }, data: daysAsc.map(d => d.p != null && d.p3 != null ? d.p : null), z:1 };
+    const band = { name:'Buffer (3rd day)', type:'line', yAxisIndex:1, stack:'band', symbol:'none', silent:true, lineStyle:{ opacity:0 },
+      areaStyle:{ color: VIZ.buf, opacity:.2 }, data: daysAsc.map(d => d.p != null && d.p3 != null ? Math.max(0, d.p3 - d.p) : null), z:1 };
+    const tipFor = i => {
+      const d = daysAsc[i];
+      const row = (c, t, v) => `<div style="display:flex;justify-content:space-between;gap:18px"><span><i style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${c};margin-right:6px"></i>${t}</span><b>${v}</b></div>`;
+      return `<div style="font-size:12px;min-width:210px"><div style="font-weight:600;margin-bottom:6px">${bucketLabel(d.day, gran)} · ${d.total} placed</div>`
+        + row(VIZ.met, 'Out in SLA (2 days)', d.m) + row(VIZ.buf, 'Out on day 3', d.b) + row(VIZ.buf, 'Past SLA, in buffer', d.bo)
+        + row(VIZ.miss, 'Later than day 3', d.l3) + row(VIZ.open, 'Open, on time', d.op)
+        + `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,.12)">`
+        + row(LINE2, 'Inside 2 days', d.p == null ? '–' : d.p + '%' + (d.op || d.bo ? ' so far' : ''))
+        + row(VIZ.buf, 'Inside 3 days', d.p3 == null ? '–' : d.p3 + '%' + (d.bo ? ' so far' : '')) + `</div></div>`;
+    };
+    chart.setOption({
+      animation:true, animationDuration:700, animationEasing:'cubicOut',
+      textStyle:{ fontFamily:'inherit', color:AX },
+      grid:{ left:44, right:50, top:58, bottom:34 },
+      legend:{ top:0, left:0, itemWidth:11, itemHeight:11, itemGap:16, icon:'roundRect', textStyle:{ color:'#c8c8c8', fontSize:11 },
+        data:['Out in SLA (2 days)', 'Out on day 3', 'Past SLA, in buffer', 'Later than day 3', 'Open, on time', 'Inside 2 days (%)', 'Inside 3 days (%)'] },
+      tooltip:{ trigger:'axis', axisPointer:{ type:'shadow', shadowStyle:{ color:'rgba(255,255,255,.05)' } },
+        backgroundColor:'rgba(23,23,23,.72)', borderColor:'rgba(255,255,255,.12)', textStyle:{ color:'#fafafa' },
+        extraCssText:'backdrop-filter:blur(10px);border-radius:14px;padding:10px 12px;', formatter: ps => tipFor(ps[0].dataIndex) },
+      xAxis:{ type:'category', data:cats, axisLine:{ lineStyle:{ color:GRID } }, axisTick:{ show:false }, axisLabel:{ color:AX, fontSize:10, hideOverlap:true } },
+      yAxis:[
+        { type:'value', minInterval:1, axisLabel:{ color:AX, fontSize:10 }, splitLine:{ lineStyle:{ color:GRID, type:'dashed' } } },
+        { type:'value', min:lo, max:100, axisLabel:{ color:AX, fontSize:10, formatter:'{value}%' }, splitLine:{ show:false } }],
+      series:[
+        bar('Out in SLA (2 days)', 'm', VIZ.met), bar('Out on day 3', 'b', VIZ.buf), bar('Past SLA, in buffer', 'bo', VIZ.buf, true),
+        bar('Later than day 3', 'l3', VIZ.miss, true), bar('Open, on time', 'op', VIZ.open),
+        base, band,
+        pct('Inside 2 days (%)', 'p', LINE2, false), pct('Inside 3 days (%)', 'p3', VIZ.buf, true)],
+    });
+    chart.on('click', p => { const d = daysAsc[p.dataIndex]; if (d) openDay(d.day); });
+    const ro = new ResizeObserver(() => chart.resize()); ro.observe(mount); chart.__ro = ro;
+  }).catch(() => wrap.replaceChildren(...slaChartsSvg(daysAsc, openDay, gran).childNodes));
+  return wrap;
+}
+
+function slaChartsSvg(daysAsc, openDay, gran = 'day') {
   const unit = gran === 'week' ? 'week' : 'day';
   const every = Math.max(1, Math.ceil(daysAsc.length / (gran === 'week' ? 12 : 20)));   // label every Nth tick
   const W = 560, H = 230, P = { l: 30, r: 8, t: 10, b: 24 };
