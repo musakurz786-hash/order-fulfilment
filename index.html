@@ -1852,6 +1852,25 @@ function renderTracker(main) {
   mt.append(mRow('Year to date', yearRow, () => openSlaList('Year to date', yearRow.xs), 'rowlink total-row'));
   main.append(h('div', { class:'card', style:'overflow-x:auto' }, mt));
 
+  // A month split into weeks: Week 1 = days 1–7, Week 2 = 8–14, Week 3 = 15–21, Week 4 = 22 to the end of the month.
+  // It shows the month picked in the Month slicer (this month when none is picked), or its own picker here.
+  const wkMonth = T.wkMonth || T.month || todayKey.slice(0, 7);
+  const wkDef = [['Week 1', 1, 7], ['Week 2', 8, 14], ['Week 3', 15, 21], ['Week 4', 22, 31]];
+  const wkRows = wkDef.map(([label, a, b]) => {
+    const xs = (byMonth[wkMonth] || []).filter(x => { const d = Number(x.day.slice(8)); return d >= a && d <= b; });
+    const lastDay = new Date(Number(wkMonth.slice(0, 4)), Number(wkMonth.slice(5, 7)), 0).getDate();
+    const end = Math.min(b, lastDay);
+    const mon = new Date(wkMonth + '-15T12:00:00').toLocaleDateString('en-ZA', { month:'short' });
+    return { label: `${label} · ${a}–${end} ${mon}`, ...sumOf(xs) };
+  });
+  const wkPick = h('select', { class:'input slicer-input', 'aria-label':'Month to split into weeks', onchange: e => { T.wkMonth = e.target.value; render(); } },
+    ...Object.keys(byMonth).sort().reverse().map(k => h('option', { value:k, selected: wkMonth === k }, monthName(k))));
+  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Weeks in ', wkPick),
+    h('p', { class:'muted sm' }, 'The month split into Week 1 (1st–7th), Week 2 (8th–14th), Week 3 (15th–21st) and Week 4 (22nd to month end). Same columns as above; click a week for its orders.'))));
+  const wt = h('table', { class:'plain' }, h('tr', null, ...['Week','Placed','Out in SLA','Out on day 3','Later / overdue','Open','Inside 2 days','Inside 3 days'].map(t => h('th', null, t))));
+  for (const r of wkRows) wt.append(mRow(r.label, r, () => openSlaList(r.label + ' ' + monthName(wkMonth), r.xs)));
+  main.append(h('div', { class:'card', style:'overflow-x:auto' }, wt));
+
   main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, gran === 'week' ? 'Week by week' : 'Day by day', h('span', { class:'count' }, daysAsc.length)),
     h('p', { class:'muted sm' }, `Orders by the ${unitName.toLowerCase()} they were placed${gran === 'week' ? ' (Monday to Sunday)' : ''}. “Missed” means the first parcel went out late, or still hasn’t and the 2 days are up. Click a ${unitName.toLowerCase()} for its orders.`))));
   const tbl = h('table', { class:'plain' }, h('tr', null, ...[unitName,'Placed','Out in SLA','Missed','Open, in time','SLA %'].map(t => h('th', null, t))));
