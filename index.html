@@ -393,7 +393,7 @@ async function hqNotFound(line) {
     const hq = avail(line.sku, hqLoc());
     let r = await supa.from('ful_lines').update({ hq_check: 'not_found', hq_checked_at: new Date().toISOString() }).eq('id', line.id);
     if (r.error) throw r.error;
-    r = await supa.from('ful_hq_adjustments').insert({ sku: line.sku, item_name: line.item_name, order_name: line.order_name, line_id: line.id, hq_available: hq });
+    r = await supa.from('ful_hq_adjustments').insert({ sku: line.sku, item_name: line.item_name, order_name: line.order_name, line_id: line.id, hq_available: hq, qty: line.qty });
     if (r.error) throw r.error;
     await logEvent(line, 'hq_not_found', `HQ system showed ${hq}`);
   }, 'Added to HQ stock adjustments');
@@ -2079,13 +2079,16 @@ function renderReports(main) {
 }
 
 // Why an item is on the adjustment sheet
-const ADJ_WHY = { not_found:'Not found at HQ', refund:'Refunded – HQ still shows stock' };
+const ADJ_WHY = { not_found:'Not found at HQ', refund:'Refunded – HQ still shows stock', store_shipped:'Shipped from a store – HQ showed stock' };
+const ADJ_TIP = { not_found:'The warehouse recheck couldn’t find it', refund:'Marked for refund: no store could supply it',
+  store_shipped:'HQ couldn’t pick it, so a store is sending it, while HQ’s system showed stock: HQ’s count is too high by these units' };
+const ADJ_BADGE = { not_found:'b-wait', refund:'b-hold', store_shipped:'b-sent' };
 // HQ stock adjustments as a CSV for the stock team (opens in Excel)
 function downloadAdjustmentsCsv(onlyOpen) {
   const rows = S.adjustments.filter(a => !onlyOpen || !a.resolved_at);
   const cell = v => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-  const csv = [['Reported','SKU','Item','Order','Why','HQ showed','Status'], ...rows.map(a => [
-    new Date(a.reported_at).toLocaleString('en-ZA'), '="' + a.sku + '"', a.item_name, a.order_name, ADJ_WHY[a.reason] || ADJ_WHY.not_found, a.hq_available, a.resolved_at ? 'Adjusted ' + new Date(a.resolved_at).toLocaleDateString('en-ZA') : 'To adjust'])]
+  const csv = [['Reported','SKU','Item','Order','Why','Adjust down by','HQ showed','Status'], ...rows.map(a => [
+    new Date(a.reported_at).toLocaleString('en-ZA'), '="' + a.sku + '"', a.item_name, a.order_name, ADJ_WHY[a.reason] || ADJ_WHY.not_found, a.qty ?? 1, a.hq_available, a.resolved_at ? 'Adjusted ' + new Date(a.resolved_at).toLocaleDateString('en-ZA') : 'To adjust'])]
     .map(r => r.map(cell).join(',')).join('\r\n');
   const a = h('a', { href: URL.createObjectURL(new Blob(['﻿' + csv], { type:'text/csv' })), download: `HQ stock adjustments ${new Date().toLocaleDateString('en-CA')}.csv` });
   document.body.append(a); a.click(); a.remove();
@@ -2093,7 +2096,7 @@ function downloadAdjustmentsCsv(onlyOpen) {
 
 function renderAdjust(main) {
   main.append(h('div', { class:'page-head' }, h('div', null, h('div', { class:'page-title' }, 'HQ stock adjustments'),
-    h('div', { class:'page-sub' }, 'What the warehouse recheck turned up: SKUs HQ’s system shows but nobody could find, and short picks that were at HQ after all.'))));
+    h('div', { class:'page-sub' }, 'Where HQ’s system count is wrong: SKUs it shows but nobody could find (including items a store had to ship), and short picks that were at HQ after all.'))));
 
   // Found on recheck: why the picker missed it
   const found = S.lines.filter(l => l.state === 'hq_found').sort((a, b) => String(b.hq_checked_at).localeCompare(String(a.hq_checked_at)));
@@ -2110,15 +2113,16 @@ function renderAdjust(main) {
   }
 
   main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Adjust HQ stock', h('span', { class:'count' }, S.adjustments.filter(a => !a.resolved_at).length)),
-    h('p', { class:'muted sm' }, 'HQ couldn’t find these, so HQ’s system count needs adjusting down: items the warehouse recheck couldn’t find, and refunded items (no store had it either) where HQ’s system still shows 2 or more units. “HQ showed” follows the live count; a refund flag closes by itself once HQ drops below 2.')),
+    h('p', { class:'muted sm' }, 'HQ couldn’t pick these, so HQ’s system count is too high and needs adjusting down by the units shown (it can grow again through stock takes): items a store is shipping while HQ’s system showed stock, items the warehouse recheck couldn’t find, and refunded items where HQ still shows 2 or more units. “HQ showed” follows the live count; a flag closes by itself once HQ has nothing left to adjust (or the item turns out to be at HQ, or is cancelled).')),
     S.adjustments.length ? h('div', { class:'actions' },
       h('button', { class:'btn sm', onclick: () => downloadAdjustmentsCsv(true) }, 'Download to adjust (CSV)'),
       h('button', { class:'btn ghost sm', onclick: () => downloadAdjustmentsCsv(false) }, 'Download all')) : null));
   if (!S.adjustments.length) { main.append(h('div', { class:'empty' }, 'Nothing logged yet.')); return; }
-  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Reported','SKU','Item','Order','Why','HQ showed','Status',''].map(t => h('th', null, t))));
+  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Reported','SKU','Item','Order','Why','Adjust down by','HQ showed','Status',''].map(t => h('th', null, t))));
   for (const a of S.adjustments) tbl.append(h('tr', null,
     h('td', { class:'mono' }, when(a.reported_at)), h('td', { class:'mono' }, a.sku), h('td', null, a.item_name || ''), h('td', { class:'mono' }, a.order_name || ''),
-    h('td', null, h('span', { class:'badge ' + (a.reason === 'refund' ? 'b-hold' : 'b-wait'), title: a.reason === 'refund' ? 'Marked for refund: no store could supply it' : 'The warehouse recheck couldn’t find it' }, ADJ_WHY[a.reason] || ADJ_WHY.not_found)),
+    h('td', null, h('span', { class:'badge ' + (ADJ_BADGE[a.reason] || 'b-wait'), title: ADJ_TIP[a.reason] || ADJ_TIP.not_found }, ADJ_WHY[a.reason] || ADJ_WHY.not_found)),
+    h('td', { class:'mono' }, String(a.qty ?? 1)),
     h('td', { class:'mono' }, String(a.hq_available ?? '')),
     h('td', null, a.resolved_at ? h('span', { class:'badge b-sent' }, 'Adjusted ' + when(a.resolved_at)) : h('span', { class:'badge b-wait' }, 'To adjust')),
     h('td', null, isAdmin() && !a.resolved_at ? h('button', { class:'btn sm', onclick: () => act(async () => {
