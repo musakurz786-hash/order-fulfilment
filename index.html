@@ -2123,6 +2123,13 @@ function renderAdjust(main) {
       const r = await supa.from('ful_hq_adjustments').update({ resolved_at: new Date().toISOString(), resolution: 'Adjusted', adjusted_by: String(S.email).toLowerCase() }).eq('id', a.id); if (r.error) throw r.error;
     }, 'Marked adjusted') }, 'Mark adjusted') : null)
       : h('td', { class:'sm' }, a.resolution === 'Adjusted' ? 'Adjusted' + (a.adjusted_by ? ' by ' + nameOf(a.adjusted_by) : '') : (a.resolution || '')));
+  // Filter: what is still to adjust, what has been adjusted (the archive), or both
+  const F = S.adjF || 'open';
+  const doneRows = S.adjustments.filter(a => a.resolved_at);
+  const fBtn = (v, text) => h('button', { 'aria-pressed': String(F === v), onclick: () => { S.adjF = v; render(); } }, text);
+  main.append(h('div', { class:'slicers' }, h('div', { class:'slicer' }, h('span', { class:'slicer-l' }, 'Show'),
+    h('div', { class:'toggle', role:'group', 'aria-label':'Adjustment filter' }, fBtn('open', `Not adjusted (${open.length})`), fBtn('done', `Adjusted (${doneRows.length})`), fBtn('all', `All (${S.adjustments.length})`)))));
+  if (F !== 'done') {
   main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'To adjust', h('span', { class:'count' }, open.length)),
     h('p', { class:'muted sm' }, `HQ couldn’t pick these, so HQ’s system count is too high and needs adjusting down by the units shown (it can grow again through stock takes): items a store is shipping while HQ’s system showed stock, items the warehouse recheck couldn’t find, and refunded items where HQ still shows 2 or more units. Once you’ve adjusted them, click “Mark all adjusted”: the sheet is archived below and a new one builds from whatever comes in next. “HQ showed” follows the live count; a row also closes by itself once HQ has nothing left to adjust (or the item turns out to be at HQ, or is cancelled).`)),
     h('div', { class:'actions' },
@@ -2140,11 +2147,13 @@ function renderAdjust(main) {
     for (const a of open) tbl.append(adjRow(a, true));
     main.append(h('div', { class:'card', style:'overflow-x:auto' }, tbl));
   }
+  }
 
   // Archive: what has been adjusted, newest first. "Mark all adjusted" clicks stay together as one batch; single
   // ones and rows that closed by themselves group by the day they closed.
-  const done = S.adjustments.filter(a => a.resolved_at);
-  if (done.length) {
+  const done = doneRows;
+  if (F !== 'open' && !done.length) main.append(h('div', { class:'empty' }, 'Nothing adjusted yet.'));
+  if (F !== 'open' && done.length) {
     const groups = new Map();
     for (const a of done) {
       const day = new Date(a.resolved_at).toLocaleDateString('en-CA');
