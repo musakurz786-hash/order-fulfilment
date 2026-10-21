@@ -2084,13 +2084,12 @@ const ADJ_TIP = { not_found:'The warehouse recheck couldn’t find it', refund:'
   store_shipped:'HQ couldn’t pick it, so a store is sending it, while HQ’s system showed stock: HQ’s count is too high by these units' };
 const ADJ_BADGE = { not_found:'b-wait', refund:'b-hold', store_shipped:'b-sent' };
 // HQ stock adjustments as a CSV for the stock team (opens in Excel)
-function downloadAdjustmentsCsv(onlyOpen) {
-  const rows = S.adjustments.filter(a => !onlyOpen || !a.resolved_at);
+function downloadAdjustmentsCsv(rows, label) {
   const cell = v => { const s = String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
   const csv = [['Reported','SKU','Item','Order','Why','Adjust down by','HQ showed','Status'], ...rows.map(a => [
     new Date(a.reported_at).toLocaleString('en-ZA'), '="' + a.sku + '"', a.item_name, a.order_name, ADJ_WHY[a.reason] || ADJ_WHY.not_found, a.qty ?? 1, a.hq_available, a.resolved_at ? 'Adjusted ' + new Date(a.resolved_at).toLocaleDateString('en-ZA') : 'To adjust'])]
     .map(r => r.map(cell).join(',')).join('\r\n');
-  const a = h('a', { href: URL.createObjectURL(new Blob(['﻿' + csv], { type:'text/csv' })), download: `HQ stock adjustments ${new Date().toLocaleDateString('en-CA')}.csv` });
+  const a = h('a', { href: URL.createObjectURL(new Blob(['﻿' + csv], { type:'text/csv' })), download: `HQ stock adjustments ${label || new Date().toLocaleDateString('en-CA')}.csv` });
   document.body.append(a); a.click(); a.remove();
 }
 
@@ -2112,23 +2111,61 @@ function renderAdjust(main) {
     main.append(h('div', { class:'card', style:'overflow-x:auto' }, ft));
   }
 
-  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Adjust HQ stock', h('span', { class:'count' }, S.adjustments.filter(a => !a.resolved_at).length)),
-    h('p', { class:'muted sm' }, 'HQ couldn’t pick these, so HQ’s system count is too high and needs adjusting down by the units shown (it can grow again through stock takes): items a store is shipping while HQ’s system showed stock, items the warehouse recheck couldn’t find, and refunded items where HQ still shows 2 or more units. “HQ showed” follows the live count; a flag closes by itself once HQ has nothing left to adjust (or the item turns out to be at HQ, or is cancelled).')),
-    S.adjustments.length ? h('div', { class:'actions' },
-      h('button', { class:'btn sm', onclick: () => downloadAdjustmentsCsv(true) }, 'Download to adjust (CSV)'),
-      h('button', { class:'btn ghost sm', onclick: () => downloadAdjustmentsCsv(false) }, 'Download all')) : null));
-  if (!S.adjustments.length) { main.append(h('div', { class:'empty' }, 'Nothing logged yet.')); return; }
-  const tbl = h('table', { class:'plain' }, h('tr', null, ...['Reported','SKU','Item','Order','Why','Adjust down by','HQ showed','Status',''].map(t => h('th', null, t))));
-  for (const a of S.adjustments) tbl.append(h('tr', null,
+  // The sheet to work from: only what still has to be adjusted. "Mark all adjusted" archives it; the next sheet builds from scratch.
+  const open = S.adjustments.filter(a => !a.resolved_at);
+  const units = xs => xs.reduce((n, a) => n + (a.qty ?? 1), 0);
+  const adjRow = (a, withButton) => h('tr', null,
     h('td', { class:'mono' }, when(a.reported_at)), h('td', { class:'mono' }, a.sku), h('td', null, a.item_name || ''), h('td', { class:'mono' }, a.order_name || ''),
     h('td', null, h('span', { class:'badge ' + (ADJ_BADGE[a.reason] || 'b-wait'), title: ADJ_TIP[a.reason] || ADJ_TIP.not_found }, ADJ_WHY[a.reason] || ADJ_WHY.not_found)),
     h('td', { class:'mono' }, String(a.qty ?? 1)),
     h('td', { class:'mono' }, String(a.hq_available ?? '')),
-    h('td', null, a.resolved_at ? h('span', { class:'badge b-sent' }, 'Adjusted ' + when(a.resolved_at)) : h('span', { class:'badge b-wait' }, 'To adjust')),
-    h('td', null, isAdmin() && !a.resolved_at ? h('button', { class:'btn sm', onclick: () => act(async () => {
-      const r = await supa.from('ful_hq_adjustments').update({ resolved_at: new Date().toISOString(), resolution: 'Adjusted' }).eq('id', a.id); if (r.error) throw r.error;
-    }, 'Marked adjusted') }, 'Mark adjusted') : null)));
-  main.append(h('div', { class:'card', style:'overflow-x:auto' }, tbl));
+    withButton ? h('td', null, isAdmin() ? h('button', { class:'btn sm', onclick: () => act(async () => {
+      const r = await supa.from('ful_hq_adjustments').update({ resolved_at: new Date().toISOString(), resolution: 'Adjusted', adjusted_by: String(S.email).toLowerCase() }).eq('id', a.id); if (r.error) throw r.error;
+    }, 'Marked adjusted') }, 'Mark adjusted') : null)
+      : h('td', { class:'sm' }, a.resolution === 'Adjusted' ? 'Adjusted' + (a.adjusted_by ? ' by ' + nameOf(a.adjusted_by) : '') : (a.resolution || '')));
+  main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'To adjust', h('span', { class:'count' }, open.length)),
+    h('p', { class:'muted sm' }, `HQ couldn’t pick these, so HQ’s system count is too high and needs adjusting down by the units shown (it can grow again through stock takes): items a store is shipping while HQ’s system showed stock, items the warehouse recheck couldn’t find, and refunded items where HQ still shows 2 or more units. Once you’ve adjusted them, click “Mark all adjusted”: the sheet is archived below and a new one builds from whatever comes in next. “HQ showed” follows the live count; a row also closes by itself once HQ has nothing left to adjust (or the item turns out to be at HQ, or is cancelled).`)),
+    h('div', { class:'actions' },
+      open.length ? h('button', { class:'btn sm', onclick: () => downloadAdjustmentsCsv(open, 'to adjust ' + new Date().toLocaleDateString('en-CA')) }, 'Download to adjust (CSV)') : null,
+      open.length && isAdmin() ? h('button', { class:'btn primary sm', onclick: () => {
+        if (!confirm(`Archive these ${open.length} item${open.length === 1 ? '' : 's'} (${units(open)} unit${units(open) === 1 ? '' : 's'}) as adjusted? Only do this once HQ’s stock has been adjusted.`)) return;
+        act(async () => {
+          const r = await supa.rpc('ful_adjust_all', { p_ids: open.map(a => a.id) });
+          if (r.error) throw r.error;
+        }, 'Archived – the next sheet starts fresh');
+      } }, `Mark all adjusted (${open.length})`) : null)));
+  if (!open.length) main.append(h('div', { class:'empty' }, 'Nothing to adjust right now – everything so far has been adjusted. New items appear here as they come in.'));
+  else {
+    const tbl = h('table', { class:'plain' }, h('tr', null, ...['Reported','SKU','Item','Order','Why','Adjust down by','HQ showed',''].map(t => h('th', null, t))));
+    for (const a of open) tbl.append(adjRow(a, true));
+    main.append(h('div', { class:'card', style:'overflow-x:auto' }, tbl));
+  }
+
+  // Archive: what has been adjusted, newest first. "Mark all adjusted" clicks stay together as one batch; single
+  // ones and rows that closed by themselves group by the day they closed.
+  const done = S.adjustments.filter(a => a.resolved_at);
+  if (done.length) {
+    const groups = new Map();
+    for (const a of done) {
+      const day = new Date(a.resolved_at).toLocaleDateString('en-CA');
+      const key = a.adjusted_batch || ('day-' + day);
+      if (!groups.has(key)) groups.set(key, { key, at: a.resolved_at, day, batch: !!a.adjusted_batch, by: a.adjusted_by, rows: [] });
+      const g = groups.get(key); g.rows.push(a); if (a.resolved_at > g.at) g.at = a.resolved_at;
+    }
+    const ordered = [...groups.values()].sort((a, b) => String(b.at).localeCompare(String(a.at)));
+    main.append(h('div', { class:'section-head' }, h('div', null, h('h2', null, 'Adjusted (archive)', h('span', { class:'count' }, done.length)),
+      h('p', { class:'muted sm' }, 'Everything already adjusted, newest first. Open a batch to see its items or download it.'))));
+    for (const g of ordered) {
+      const t = h('table', { class:'plain' }, h('tr', null, ...['Reported','SKU','Item','Order','Why','Adjusted down by','HQ showed','How'].map(x => h('th', null, x))));
+      for (const a of g.rows.sort((x, y) => String(y.reported_at).localeCompare(String(x.reported_at)))) t.append(adjRow(a, false));
+      const label = g.batch ? `Batch adjusted ${when(g.at)}${g.by ? ' by ' + nameOf(g.by) : ''}` : `Closed ${dayLabel(g.day)}`;
+      main.append(h('details', { class:'card', style:'padding:12px 16px' },
+        h('summary', { style:'cursor:pointer;display:flex;gap:12px;align-items:center;flex-wrap:wrap' },
+          h('b', null, label), h('span', { class:'muted sm' }, `${g.rows.length} item${g.rows.length === 1 ? '' : 's'} · ${units(g.rows)} unit${units(g.rows) === 1 ? '' : 's'}`),
+          h('button', { class:'btn ghost sm', style:'margin-left:auto', onclick: e => { e.preventDefault(); e.stopPropagation(); downloadAdjustmentsCsv(g.rows, 'adjusted ' + g.day); } }, 'Download (CSV)')),
+        h('div', { style:'overflow-x:auto;margin-top:10px' }, t)));
+    }
+  }
 }
 
 function renderStores(main) {
