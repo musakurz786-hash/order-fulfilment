@@ -2094,8 +2094,8 @@ function downloadAdjustmentsCsv(rows, label) {
 }
 
 // The stock system's bulk stock-adjustment upload (same columns as its BulkUpdateStockAdjustment template). One line per
-// SKU at the HQ location: 'NonZero' = modify existing stock, Quantity = the NEW total at HQ (HQ's count now minus the
-// units to adjust down, never below 0). Plain CSV: no Excel text tricks, no byte-order mark, SKUs as plain digits.
+// SKU at the HQ location: Quantity = the NEW total at HQ (HQ's count now minus the units to adjust down, never below 0).
+// A line whose new total is 0 is a 'Zero' line (the system rejects those as 'NonZero'); every other line is 'NonZero'. Plain CSV: no Excel text tricks, no byte-order mark, SKUs as plain digits.
 const ADJ_UPLOAD_HEAD = ['Zero/NonZero','Location','SKU','Name','Bin','BatchSerialNumber','ExpiryDate_YYYYMMDD','Quantity','UnitCost','Comments','ReceivedDate_YYYYMMDD'];
 function adjustmentsUploadCsv(rows) {
   const bySku = new Map();
@@ -2108,7 +2108,7 @@ function adjustmentsUploadCsv(rows) {
   const lines = [...bySku.values()].map(g => {
     const hq = S.stock?.[g.sku]?.[hqLoc()] ?? g.shown ?? 0;   // HQ's latest count, else what it showed when flagged
     const qty = Math.max(0, hq - g.units);
-    return [ 'NonZero', 'HQ', g.sku, g.name.replace(/ – /g, ' - '), '', '', '', qty, '', `HQ showed ${hq}, take off ${g.units} (${g.orders.join(', ')})`, '' ];
+    return [ qty === 0 ? 'Zero' : 'NonZero', 'HQ', g.sku, g.name.replace(/ – /g, ' - '), '', '', '', qty, '', `HQ showed ${hq}, take off ${g.units} (${g.orders.join(', ')})`, '' ];
   });
   return [ADJ_UPLOAD_HEAD, ...lines].map(r => r.map(cell).join(',')).join('\r\n') + '\r\n';
 }
