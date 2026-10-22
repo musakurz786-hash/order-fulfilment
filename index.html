@@ -2105,8 +2105,9 @@ function adjustmentsUploadCsv(rows) {
     bySku.set(a.sku, g);
   }
   const cell = v => { const s = String(v ?? ''); return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-  const lines = [...bySku.values()].map(g => {
-    const hq = S.stock?.[g.sku]?.[hqLoc()] ?? g.shown ?? 0;   // HQ's latest count, else what it showed when flagged
+  // SKUs HQ has no stock of (count 0 or less) are left off: there is nothing to take down
+  const lines = [...bySku.values()].map(g => ({ ...g, hq: S.stock?.[g.sku]?.[hqLoc()] ?? g.shown ?? 0 })).filter(g => g.hq > 0).map(g => {
+    const hq = g.hq;   // HQ's latest count, else what it showed when flagged
     const qty = Math.max(0, hq - g.units);
     return [ qty === 0 ? 'Zero' : 'NonZero', 'HQ', g.sku, g.name.replace(/ – /g, ' - '), '', '', '', qty, '', `HQ showed ${hq}, take off ${g.units} (${g.orders.join(', ')})`, '' ];
   });
