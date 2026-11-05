@@ -197,7 +197,8 @@ async function loadAll() {
   }
   for (const c of chunks(orderNames, 200)) { const r = await supa.from('ful_orders').select('*').in('order_name', c); if (r.error) throw r.error; ord.push(...r.data); }
   for (const c of chunks(orderNames, 200)) { const r = await supa.from('ful_order_notes').select('*').in('order_name', c).order('created_at'); if (r.error) throw r.error; notes.push(...r.data); }
-  for (const c of chunks(skus, 100)) { const r = await supa.from('ful_stock').select('sku,location_name,available,synced_at').in('sku', c).limit(10000); if (r.error) throw r.error; st.push(...r.data); }
+  // 20 SKUs x ~38 locations stays under the API's 1000-row response cap (100 SKUs silently truncated, showing 0 stock)
+  for (const c of chunks(skus, 20)) { const r = await supa.from('ful_stock').select('sku,location_name,available,synced_at').in('sku', c).limit(10000); if (r.error) throw r.error; st.push(...r.data); }
   S.attempts = att; S.events = ev;
   S.notes = {}; for (const n of notes) (S.notes[n.order_name] ||= []).push(n);
   S.orders = Object.fromEntries(ord.map(o => [o.order_name, o]));
